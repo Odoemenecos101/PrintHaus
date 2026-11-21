@@ -1,0 +1,6 @@
+{
+  "name": "PrintHaus",
+  "description": "Online document printing, transparent pricing, order tracking, and central campus pickup platform for Pan-Atlantic University students.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
