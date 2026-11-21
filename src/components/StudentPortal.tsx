@@ -30,6 +30,11 @@ import {
   calculateMultiDocumentOrderPricing,
   formatNaira,
 } from '../types/printhaus';
+import {
+  auth,
+  fetchOrdersFromFirestore,
+  syncOrderToFirestore,
+} from '../firebase';
 import { OrderHistory } from './OrderHistory';
 import { QrCodeBox } from './QrCodeBox';
 
@@ -195,7 +200,25 @@ export function StudentPortal({
       const ordData = await ordRes.json();
       const ntfData = await ntfRes.json();
       const cmpData = await cmpRes.json();
-      const fetchedOrders: PrintOrder[] = ordData.orders || [];
+      const backendOrders: PrintOrder[] = ordData.orders || [];
+      let fetchedOrders: PrintOrder[] = backendOrders;
+
+      if (auth.currentUser && auth.currentUser.uid === user.id) {
+        try {
+          const cloudOrders = await fetchOrdersFromFirestore(auth.currentUser.uid);
+          if (cloudOrders.length > 0) {
+            const seen = new Set(backendOrders.map((o) => o.id));
+            fetchedOrders = [
+              ...backendOrders,
+              ...cloudOrders.filter((co) => !seen.has(co.id)),
+            ].sort(
+              (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+            );
+          }
+        } catch {
+          // Keep backend orders if Firestore query is unavailable
+        }
+      }
 
       if (hasInitializedStatusesRef.current) {
         for (const ord of fetchedOrders) {
@@ -263,6 +286,10 @@ export function StudentPortal({
           }),
         });
         if (res.ok) {
+          const statusData = await res.json().catch(() => null);
+          if (statusData?.order && auth.currentUser && auth.currentUser.uid === user.id) {
+            await syncOrderToFirestore(auth.currentUser.uid, statusData.order).catch(() => {});
+          }
           await loadStudentData();
           setSelectedOrderId(candidate.id);
           return;
@@ -290,6 +317,9 @@ export function StudentPortal({
       };
 
       setOrders((prev) => prev.map((o) => (o.id === candidate.id ? updatedOrder : o)));
+      if (auth.currentUser && auth.currentUser.uid === user.id) {
+        syncOrderToFirestore(auth.currentUser.uid, updatedOrder).catch(() => {});
+      }
       prevStatusesRef.current[candidate.id] = 'ready_for_collection';
       setNotifications((prev) => [
         {
@@ -422,6 +452,9 @@ export function StudentPortal({
       if (!res.ok) {
         setUploadError(data.error || 'Order placement failed.');
         return;
+      }
+      if (auth.currentUser && auth.currentUser.uid === user.id) {
+        await syncOrderToFirestore(auth.currentUser.uid, data.order).catch(() => {});
       }
       setOrderSuccess(data.order);
       setSelectedOrderId(data.order.id);

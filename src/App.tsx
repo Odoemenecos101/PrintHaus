@@ -1,9 +1,16 @@
 import { useEffect, useState } from 'react';
+import { signOut } from 'firebase/auth';
 import { AuthModal } from './components/AuthModal';
 import { LandingView } from './components/LandingView';
 import { StudentPortal } from './components/StudentPortal';
 import { StaffPortal } from './components/StaffPortal';
 import { AdminPortal } from './components/AdminPortal';
+import { useFirebase } from './context/FirebaseContext';
+import {
+  auth,
+  fetchFirestoreUserProfile,
+  syncFirebaseUserWithServer,
+} from './firebase';
 import { PricingConfig, UserAccount } from './types/printhaus';
 
 const DEFAULT_PRICING: PricingConfig = {
@@ -28,6 +35,7 @@ const DEFAULT_PRICING: PricingConfig = {
 const STORAGE_KEY = 'printhaus_user_session';
 
 export default function App() {
+  const { firebaseUser, authReady } = useFirebase();
   const [pricing, setPricing] = useState<PricingConfig>(DEFAULT_PRICING);
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(() => {
     try {
@@ -50,6 +58,28 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (!authReady || !firebaseUser) return;
+    let active = true;
+    (async () => {
+      try {
+        const profile = await fetchFirestoreUserProfile(firebaseUser.uid);
+        if (!active || !profile) return;
+        const synced = await syncFirebaseUserWithServer(profile);
+        if (!active) return;
+        setCurrentUser(synced);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(synced));
+        } catch {}
+      } catch {
+        // Handled by FirebaseError / ErrorBoundary if permissions fail
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [authReady, firebaseUser]);
+
   const handleAuthenticated = (user: UserAccount) => {
     setCurrentUser(user);
     try {
@@ -59,11 +89,14 @@ export default function App() {
     setViewMode('portal');
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setCurrentUser(null);
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch {}
+    if (auth.currentUser) {
+      await signOut(auth).catch(() => {});
+    }
     setViewMode('landing');
   };
 

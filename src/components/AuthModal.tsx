@@ -1,5 +1,13 @@
-import React, { useState } from 'react';
-import { X, ArrowRight } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
+import { ArrowRight, X } from 'lucide-react';
+import {
+  auth,
+  createFirestoreUserProfile,
+  fetchFirestoreUserProfile,
+  googleProvider,
+  syncFirebaseUserWithServer,
+} from '../firebase';
 import {
   HostelGender,
   PAU_FEMALE_HOSTELS,
@@ -48,8 +56,14 @@ const DEMO_USERS = [
   },
 ];
 
-export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthenticated }: AuthModalProps) {
-  const [mode, setMode] = useState<'login' | 'register'>(initialMode);
+export function AuthModal({
+  isOpen,
+  initialMode = 'login',
+  onClose,
+  onAuthenticated,
+}: AuthModalProps) {
+  const [mode, setMode] = useState<'login' | 'register' | 'complete-google'>(initialMode);
+  const [pendingGoogleUser, setPendingGoogleUser] = useState<FirebaseUser | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
@@ -61,7 +75,86 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  useEffect(() => {
+    if (isOpen) {
+      setMode(initialMode);
+      setPendingGoogleUser(null);
+      setError(null);
+    }
+  }, [isOpen, initialMode]);
+
   if (!isOpen) return null;
+
+  const handleGoogleAuth = async () => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const credential = await signInWithPopup(auth, googleProvider);
+      const fbUser = credential.user;
+      const existingProfile = await fetchFirestoreUserProfile(fbUser.uid);
+
+      if (existingProfile) {
+        if (existingProfile.status === 'suspended') {
+          await signOut(auth).catch(() => {});
+          setError('This account has been suspended. Contact PrintHaus Admin.');
+          return;
+        }
+        const synced = await syncFirebaseUserWithServer(existingProfile);
+        onAuthenticated(synced);
+        return;
+      }
+
+      // First-time sign-in across any phone/device: collect PAU profile details once
+      setPendingGoogleUser(fbUser);
+      setName(fbUser.displayName || '');
+      setEmail(fbUser.email || '');
+      setMode('complete-google');
+    } catch (err: unknown) {
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: string }).code)
+          : '';
+      if (code === 'auth/popup-blocked') {
+        setError(
+          'Pop-up was blocked by your browser. Allow pop-ups for this site and tap Continue with Google again.'
+        );
+      } else if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        setError('Google sign-in was cancelled. Please try again.');
+      } else {
+        setError(
+          err instanceof Error ? err.message : 'Unable to sign in with Google right now.'
+        );
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleCompleteGoogleProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingGoogleUser) return;
+    setError(null);
+    setSubmitting(true);
+    try {
+      const created = await createFirestoreUserProfile(pendingGoogleUser, {
+        name,
+        matricNumber,
+        department,
+        residency,
+        hostelGender: residency === 'on-campus' ? hostelGender : undefined,
+        hostelName: residency === 'on-campus' ? hostelName : undefined,
+      });
+      const synced = await syncFirebaseUserWithServer(created);
+      setPendingGoogleUser(null);
+      onAuthenticated(synced);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not save your PrintHaus profile.'
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const handleLogin = async (loginEmail: string, loginPass: string) => {
     setError(null);
@@ -87,6 +180,10 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (mode === 'complete-google') {
+      await handleCompleteGoogleProfile(e);
+      return;
+    }
     if (mode === 'login') {
       await handleLogin(email, password);
       return;
@@ -123,6 +220,13 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
     }
   };
 
+  const handleCancelGoogleOnboarding = async () => {
+    setPendingGoogleUser(null);
+    setMode('login');
+    setError(null);
+    await signOut(auth).catch(() => {});
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 backdrop-blur-xs p-4"
@@ -130,11 +234,15 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
       aria-modal="true"
       aria-label="PrintHaus Account Sign In"
     >
-      <div className="w-full max-w-2xl bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xl">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200">
+      <div className="w-full max-w-2xl max-h-[92vh] overflow-y-auto bg-white border border-slate-200 rounded-xl shadow-xl">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-slate-200 sticky top-0 bg-white z-10">
           <div>
             <h2 className="text-lg font-semibold text-slate-900">
-              {mode === 'login' ? 'Sign in to PrintHaus' : 'Create a PAU Student Account'}
+              {mode === 'complete-google'
+                ? 'Complete Your PAU Student Profile'
+                : mode === 'login'
+                  ? 'Sign in to PrintHaus'
+                  : 'Create a PAU Student Account'}
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               Pan-Atlantic University document printing and campus pickup portal
@@ -144,40 +252,97 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
             type="button"
             onClick={onClose}
             aria-label="Close sign in dialog"
-            className="p-2 text-slate-500 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-colors"
+            className="p-2 text-slate-500 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-colors cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-12">
-          <form onSubmit={handleSubmit} className="md:col-span-7 p-6 space-y-4 border-b md:border-b-0 md:border-r border-slate-200">
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('login');
-                  setError(null);
-                }}
-                className={`flex-1 py-1.5 px-3 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                  mode === 'login' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Sign In
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('register');
-                  setError(null);
-                }}
-                className={`flex-1 py-1.5 px-3 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                  mode === 'register' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Student Register
-              </button>
-            </div>
+          <form
+            onSubmit={handleSubmit}
+            className="md:col-span-7 p-6 space-y-4 border-b md:border-b-0 md:border-r border-slate-200"
+          >
+            {mode !== 'complete-google' && (
+              <>
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={handleGoogleAuth}
+                  className="w-full py-2.5 px-4 bg-white border border-slate-300 hover:border-slate-400 hover:bg-slate-50 text-slate-900 text-sm font-medium rounded-lg transition-colors flex items-center justify-center gap-2.5 cursor-pointer disabled:opacity-60"
+                >
+                  <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="#4285F4"
+                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                    />
+                    <path
+                      fill="#34A853"
+                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                    />
+                    <path
+                      fill="#FBBC05"
+                      d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                    />
+                    <path
+                      fill="#EA4335"
+                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                    />
+                  </svg>
+                  <span>Continue with Google (Works on Any Phone)</span>
+                </button>
+
+                <div className="relative flex items-center py-1">
+                  <div className="grow border-t border-slate-200" />
+                  <span className="shrink mx-3 text-[11px] font-medium text-slate-400">
+                    Or use campus email
+                  </span>
+                  <div className="grow border-t border-slate-200" />
+                </div>
+
+                <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('login');
+                      setError(null);
+                    }}
+                    className={`flex-1 py-1.5 px-3 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      mode === 'login'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Sign In
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('register');
+                      setError(null);
+                    }}
+                    className={`flex-1 py-1.5 px-3 text-xs font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      mode === 'register'
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Student Register
+                  </button>
+                </div>
+              </>
+            )}
+
+            {mode === 'complete-google' && pendingGoogleUser && (
+              <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-950 space-y-1">
+                <p className="font-semibold">
+                  Signed in as {pendingGoogleUser.email}
+                </p>
+                <p className="text-blue-800">
+                  Save your PAU details once so your account and order history sync across any phone or laptop.
+                </p>
+              </div>
+            )}
 
             {error && (
               <div className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-lg">
@@ -185,13 +350,14 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
               </div>
             )}
 
-            {mode === 'register' && (
+            {(mode === 'register' || mode === 'complete-google') && (
               <>
                 <div>
                   <label className="block text-xs font-medium text-slate-700 mb-1">Full Name</label>
                   <input
                     type="text"
                     required
+                    maxLength={120}
                     value={name}
                     onChange={(e) => setName(e.target.value)}
                     placeholder="e.g. Kamsiyochukwu Obi"
@@ -200,10 +366,14 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">Matric Number</label>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Matric Number
+                    </label>
                     <input
                       type="text"
                       required
+                      minLength={2}
+                      maxLength={40}
                       value={matricNumber}
                       onChange={(e) => setMatricNumber(e.target.value)}
                       placeholder="22120612944"
@@ -211,7 +381,9 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-medium text-slate-700 mb-1">Residency</label>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Residency
+                    </label>
                     <select
                       value={residency}
                       onChange={(e) => setResidency(e.target.value as ResidencyType)}
@@ -287,37 +459,60 @@ export function AuthModal({ isOpen, initialMode = 'login', onClose, onAuthentica
               </>
             )}
 
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Email Address</label>
-              <input
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="name@pau.edu.ng"
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700"
-              />
-            </div>
+            {mode !== 'complete-google' && (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="name@pau.edu.ng"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700"
+                  />
+                </div>
 
-            <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1">Password</label>
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter password"
-                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700"
-              />
-            </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-700 mb-1">Password</label>
+                  <input
+                    type="password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Enter password"
+                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700"
+                  />
+                </div>
+              </>
+            )}
 
             <button
               type="submit"
               disabled={submitting}
               className="w-full py-2.5 px-4 bg-blue-800 hover:bg-blue-900 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-60 cursor-pointer"
             >
-              {submitting ? 'Authenticating...' : mode === 'login' ? 'Sign In' : 'Create Student Account'}
+              {submitting
+                ? 'Saving...'
+                : mode === 'complete-google'
+                  ? 'Save Profile & Enter Portal'
+                  : mode === 'login'
+                    ? 'Sign In'
+                    : 'Create Student Account'}
             </button>
+
+            {mode === 'complete-google' && (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleCancelGoogleOnboarding}
+                className="w-full py-2 px-4 text-xs font-medium text-slate-600 hover:text-slate-900 cursor-pointer"
+              >
+                Use a different Google account
+              </button>
+            )}
           </form>
 
           <div className="md:col-span-5 p-6 bg-slate-50 flex flex-col justify-between">

@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Search,
 } from 'lucide-react';
+import { auth, fetchOrdersFromFirestore } from '../firebase';
 import { PrintOrder, formatNaira } from '../types/printhaus';
 import { QrCodeBox } from './QrCodeBox';
 import { StatusBadge, StatusPipeline } from './StatusPipeline';
@@ -64,7 +65,26 @@ export function OrderHistory({
           setFetchError(data.error || 'Could not load order history.');
           return;
         }
-        const list: PrintOrder[] = data.orders || [];
+        const backendList: PrintOrder[] = data.orders || [];
+        let list: PrintOrder[] = backendList;
+
+        if (auth.currentUser && auth.currentUser.uid === studentId) {
+          try {
+            const cloudList = await fetchOrdersFromFirestore(auth.currentUser.uid);
+            if (cloudList.length > 0) {
+              const seen = new Set(backendList.map((o) => o.id));
+              list = [
+                ...backendList,
+                ...cloudList.filter((co) => !seen.has(co.id)),
+              ].sort(
+                (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+              );
+            }
+          } catch {
+            // Fallback gracefully to backend list
+          }
+        }
+
         setFetchedOrders(list);
         onOrdersLoaded?.(list);
         if (list.length > 0 && !selectedOrderId) {

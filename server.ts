@@ -88,6 +88,72 @@ async function startServer() {
     res.status(201).json({ user: sanitizeUser(newUser) });
   });
 
+  app.post('/api/auth/firebase-sync', (req: Request, res: Response) => {
+    const {
+      uid,
+      name,
+      email,
+      matricNumber,
+      school,
+      department,
+      residency,
+      hostelGender,
+      hostelName,
+    } = req.body ?? {};
+
+    if (!uid || !email) {
+      res.status(400).json({ error: 'Firebase UID and email are required.' });
+      return;
+    }
+
+    const db = getDb();
+    const cleanUid = String(uid).trim();
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const prog = department ? String(department).trim() : 'Computer Science';
+    const isCampus = residency === 'on-campus';
+
+    let existing = db.users.find(
+      (u) => u.id === cleanUid || u.email.toLowerCase() === normalizedEmail
+    );
+
+    if (existing) {
+      if (name) existing.name = String(name).trim();
+      if (matricNumber) existing.matricNumber = String(matricNumber).trim();
+      existing.department = prog;
+      existing.school = school ? String(school).trim() : getSchoolForProgramme(prog);
+      existing.residency = isCampus ? 'on-campus' : 'off-campus';
+      existing.hostelGender = isCampus
+        ? hostelGender === 'female'
+          ? 'female'
+          : 'male'
+        : undefined;
+      existing.hostelName =
+        isCampus && hostelName ? String(hostelName).trim() : undefined;
+      saveDatabase();
+      res.json({ user: sanitizeUser(existing) });
+      return;
+    }
+
+    const createdUser: UserAccount = {
+      id: cleanUid,
+      name: String(name || 'PAU Student').trim(),
+      email: normalizedEmail,
+      matricNumber: matricNumber ? String(matricNumber).trim() : 'PAU-NEW',
+      school: school ? String(school).trim() : getSchoolForProgramme(prog),
+      department: prog,
+      residency: isCampus ? 'on-campus' : 'off-campus',
+      hostelGender: isCampus ? (hostelGender === 'female' ? 'female' : 'male') : undefined,
+      hostelName: isCampus && hostelName ? String(hostelName).trim() : undefined,
+      role: 'student',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+    };
+
+    db.users.push(createdUser);
+    saveDatabase();
+    res.status(201).json({ user: sanitizeUser(createdUser) });
+  });
+
   app.patch('/api/users/:id/profile', (req: Request, res: Response) => {
     const db = getDb();
     const user = db.users.find((u) => u.id === req.params.id);
