@@ -26,7 +26,7 @@ import {
   getSchoolForProgramme,
 } from './src/types/printhaus';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 async function startServer() {
   await initDatabase();
