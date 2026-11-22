@@ -7,6 +7,8 @@ import {
   fetchFirestoreUserProfile,
   googleProvider,
   syncFirebaseUserWithServer,
+  registerEmailPasswordUser,
+  loginWithEmailPassword,
 } from '../firebase';
 import {
   HostelGender,
@@ -156,69 +158,66 @@ export function AuthModal({
     }
   };
 
-  const handleLogin = async (loginEmail: string, loginPass: string) => {
-    setError(null);
-    setSubmitting(true);
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: loginEmail, password: loginPass }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || 'Sign in failed.');
-        return;
-      }
-      onAuthenticated(data.user);
-    } catch {
-      setError('Unable to reach PrintHaus server.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
+  
+const handleLogin = async (loginEmail: string, loginPass: string) => {
+  setError(null);
+  setSubmitting(true);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (mode === 'complete-google') {
-      await handleCompleteGoogleProfile(e);
-      return;
-    }
-    if (mode === 'login') {
-      await handleLogin(email, password);
-      return;
-    }
+  try {
+    const profile = await loginWithEmailPassword(loginEmail, loginPass);
+    const synced = await syncFirebaseUserWithServer(profile);
+    onAuthenticated(synced);
+  } catch (err) {
+    setError(
+      err instanceof Error ? err.message : 'Sign in failed.'
+    );
+  } finally {
+    setSubmitting(false);
+  }
+};
 
-    setError(null);
-    setSubmitting(true);
-    try {
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name,
-          email,
-          password,
-          matricNumber,
-          school: getSchoolForProgramme(department),
-          department,
-          residency,
-          hostelGender: residency === 'on-campus' ? hostelGender : undefined,
-          hostelName: residency === 'on-campus' ? hostelName : undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || 'Registration failed.');
-        return;
-      }
-      onAuthenticated(data.user);
-    } catch {
-      setError('Unable to reach PrintHaus server.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
+  
+const handleSubmit = async (e: React.FormEvent) => {
+  e.preventDefault();
+
+  if (mode === 'complete-google') {
+    await handleCompleteGoogleProfile(e);
+    return;
+  }
+
+  if (mode === 'login') {
+    await handleLogin(email, password);
+    return;
+  }
+
+  if (!email.trim().toLowerCase().endsWith('@pau.edu.ng')) {
+    setError('Please use your PAU student email address.');
+    return;
+  }
+
+  setError(null);
+  setSubmitting(true);
+
+  try {
+    const created = await registerEmailPasswordUser(email, password, {
+      name,
+      matricNumber,
+      department,
+      residency,
+      hostelGender: residency === 'on-campus' ? hostelGender : undefined,
+      hostelName: residency === 'on-campus' ? hostelName : undefined,
+    });
+
+    const synced = await syncFirebaseUserWithServer(created);
+    onAuthenticated(synced);
+  } catch (err) {
+    setError(
+      err instanceof Error ? err.message : 'Registration failed.'
+    );
+  } finally {
+    setSubmitting(false);
+  }
+};
 
   const handleCancelGoogleOnboarding = async () => {
     setPendingGoogleUser(null);

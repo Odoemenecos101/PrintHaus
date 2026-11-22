@@ -3,6 +3,10 @@ import {
   GoogleAuthProvider,
   User as FirebaseUser,
   getAuth,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  updateProfile,
+  signOut,
 } from 'firebase/auth';
 import {
   Timestamp,
@@ -139,6 +143,29 @@ export async function fetchFirestoreUserProfile(uid: string): Promise<UserAccoun
   }
 }
 
+export async function loginWithEmailPassword(
+  email: string,
+  password: string
+): Promise<UserAccount> {
+  const credential = await signInWithEmailAndPassword(
+    auth,
+    email.trim(),
+    password
+  );
+
+  const profile = await fetchFirestoreUserProfile(credential.user.uid);
+
+  if (!profile) {
+    await signOut(auth);
+    throw new Error(
+      'Your PrintHaus profile was not found. Please register first.'
+    );
+  }
+
+  return profile;
+}
+
+
 export interface CreateFirestoreProfileInput {
   name: string;
   matricNumber: string;
@@ -201,6 +228,29 @@ export async function createFirestoreUserProfile(
     handleFirestoreError(error, OperationType.CREATE, path);
   }
 }
+
+export async function registerEmailPasswordUser(
+  email: string,
+  password: string,
+  input: CreateFirestoreProfileInput
+): Promise<UserAccount> {
+  const credential = await createUserWithEmailAndPassword(
+    auth,
+    email.trim(),
+    password
+  );
+
+  const cleanName = input.name.trim();
+
+  if (cleanName) {
+    await updateProfile(credential.user, {
+      displayName: cleanName,
+    });
+  }
+
+  return createFirestoreUserProfile(credential.user, input);
+}
+
 
 export async function syncOrderToFirestore(
   firebaseUid: string,
