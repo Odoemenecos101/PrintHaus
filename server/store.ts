@@ -49,6 +49,29 @@ export function hashPassword(password: string): string {
   return crypto.createHash('sha256').update(`printhaus-pau:${password}`).digest('hex');
 }
 
+export function hashPasswordScrypt(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `scrypt:${salt}:${derived}`;
+}
+
+export function verifyPassword(password: string, storedHash?: string): boolean {
+  if (!storedHash) return false;
+  if (storedHash.startsWith('scrypt:')) {
+    const parts = storedHash.split(':');
+    if (parts.length !== 3) return false;
+    const [, salt, expectedHex] = parts;
+    const derived = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(expectedHex, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  }
+  const legacy = Buffer.from(hashPassword(password), 'hex');
+  const expected = Buffer.from(storedHash, 'hex');
+  if (legacy.length !== expected.length) return false;
+  return crypto.timingSafeEqual(legacy, expected);
+}
+
 async function createSamplePdf(filePath: string, title: string, lines: string[], pageCount: number) {
   if (fs.existsSync(filePath)) return;
   const pdfDoc = await PDFDocument.create();

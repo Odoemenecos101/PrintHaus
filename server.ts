@@ -10,8 +10,10 @@ import {
   getStatusLabel,
   getUploadsDir,
   hashPassword,
+  hashPasswordScrypt,
   initDatabase,
   saveDatabase,
+  verifyPassword,
 } from './server/store';
 import {
   BindingOption,
@@ -67,11 +69,17 @@ async function startServer() {
     const prog = department ? String(department).trim() : 'Computer Science';
     const isCampus = residency === 'on-campus';
 
+    const rawPassword = String(password);
+    if (rawPassword.length < 6 || rawPassword.length > 128) {
+      res.status(400).json({ error: 'Password must be between 6 and 128 characters.' });
+      return;
+    }
+
     const newUser: UserAccount = {
       id: `usr_${crypto.randomUUID().slice(0, 8)}`,
       name: String(name).trim(),
       email: normalizedEmail,
-      passwordHash: hashPassword(String(password)),
+      passwordHash: hashPasswordScrypt(rawPassword),
       matricNumber: matricNumber ? String(matricNumber).trim() : 'PAU-NEW',
       school: school ? String(school).trim() : getSchoolForProgramme(prog),
       department: prog,
@@ -190,7 +198,7 @@ async function startServer() {
     const normalizedEmail = String(email ?? '').trim().toLowerCase();
     const user = db.users.find((u) => u.email.toLowerCase() === normalizedEmail);
 
-    if (!user || user.passwordHash !== hashPassword(String(password ?? ''))) {
+    if (!user || !verifyPassword(String(password ?? ''), user.passwordHash)) {
       res.status(401).json({ error: 'Invalid email or password.' });
       return;
     }
@@ -200,6 +208,226 @@ async function startServer() {
       return;
     }
 
+    res.json({ user: sanitizeUser(user) });
+  });
+
+  // --- FORGOT PASSWORD / EMAIL CODE RECOVERY ---
+  interface PasswordResetChallenge {
+    userId: string;
+    email: string;
+    salt: string;
+    codeHash: string;
+    expiresAt: number;
+    attempts: number;
+    verified: boolean;
+    recoveryTokenHash: string | null;
+    requestTimestamps: number[];
+  }
+
+  const resetChallenges = new Map<string, PasswordResetChallenge>();
+
+  const hashResetSecret = (salt: string, value: string): string =>
+    crypto.createHash('sha256').update(`${salt}:${value}`).digest('hex');
+
+  const constantTimeHexEqual = (aHex: string, bHex: string): boolean => {
+    const a = Buffer.from(aHex, 'hex');
+    const b = Buffer.from(bHex, 'hex');
+    if (a.length === 0 || a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  };
+
+  app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
+    const rawEmail = String(req.body?.email ?? '').trim().toLowerCase();
+    if (!rawEmail || rawEmail.length > 160 || !rawEmail.includes('@')) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+
+    const db = getDb();
+    const user = db.users.find((u) => u.email.toLowerCase() === rawEmail);
+    const now = Date.now();
+    const existing = resetChallenges.get(rawEmail);
+    const recentRequests = (existing?.requestTimestamps ?? []).filter(
+      (ts) => now - ts < 15 * 60 * 1000
+    );
+
+    if (recentRequests.length >= 5) {
+      res.status(429).json({
+        error: 'Too many verification code requests. Please wait a few minutes before trying again.',
+      });
+      return;
+    }
+
+    if (!user || user.status === 'suspended') {
+      res.json({
+        ok: true,
+        delivery: process.env.RESEND_API_KEY ? 'email' : 'none',
+        message: 'If an active PrintHaus account matches that email, a 6-digit verification code has been sent.',
+      });
+      return;
+    }
+
+    const code = String(crypto.randomInt(100000, 1000000));
+    const salt = crypto.randomBytes(16).toString('hex');
+    const challenge: PasswordResetChallenge = {
+      userId: user.id,
+      email: rawEmail,
+      salt,
+      codeHash: hashResetSecret(salt, code),
+      expiresAt: now + 10 * 60 * 1000,
+      attempts: 0,
+      verified: false,
+      recoveryTokenHash: null,
+      requestTimestamps: [...recentRequests, now],
+    };
+    resetChallenges.set(rawEmail, challenge);
+
+    const resendKey = process.env.RESEND_API_KEY;
+    if (resendKey) {
+      try {
+        const fromAddr = process.env.EMAIL_FROM || 'PrintHaus PAU <onboarding@resend.dev>';
+        const emailRes = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${resendKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            from: fromAddr,
+            to: [rawEmail],
+            subject: 'PrintHaus Verification Code',
+            text: `Hello ${user.name},\n\nYour PrintHaus 6-digit verification code is: ${code}\n\nThis code expires in 10 minutes. Once verified, you can choose to change your password or enter PrintHaus directly.\n\nIf you did not request this, you can safely ignore this email.`,
+          }),
+        });
+        if (!emailRes.ok) {
+          res.status(502).json({ error: 'Unable to send verification email right now. Please try again.' });
+          return;
+        }
+        res.json({
+          ok: true,
+          delivery: 'email',
+          message: `A 6-digit verification code has been sent to ${rawEmail}.`,
+        });
+        return;
+      } catch {
+        res.status(502).json({ error: 'Email service is temporarily unreachable.' });
+        return;
+      }
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      res.status(503).json({
+        error: 'Email delivery is not configured on this server. Ask PrintHaus Admin to set RESEND_API_KEY.',
+      });
+      return;
+    }
+
+    if (user.role !== 'student') {
+      res.status(503).json({
+        error: 'Email delivery requires RESEND_API_KEY for staff and admin password recovery.',
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      delivery: 'preview',
+      previewCode: code,
+      message: `A 6-digit verification code was generated for ${rawEmail}.`,
+    });
+  });
+
+  app.post('/api/auth/forgot-password/verify', (req: Request, res: Response) => {
+    const rawEmail = String(req.body?.email ?? '').trim().toLowerCase();
+    const code = String(req.body?.code ?? '').trim();
+
+    if (!rawEmail || !/^\d{6}$/.test(code)) {
+      res.status(400).json({ error: 'Enter a valid email address and 6-digit verification code.' });
+      return;
+    }
+
+    const challenge = resetChallenges.get(rawEmail);
+    if (!challenge) {
+      res.status(400).json({ error: 'No active verification code found. Please request a new code.' });
+      return;
+    }
+
+    if (Date.now() > challenge.expiresAt) {
+      resetChallenges.delete(rawEmail);
+      res.status(400).json({ error: 'Verification code has expired. Please request a new code.' });
+      return;
+    }
+
+    challenge.attempts += 1;
+    if (challenge.attempts > 5) {
+      resetChallenges.delete(rawEmail);
+      res.status(429).json({ error: 'Too many invalid attempts. Please request a new code.' });
+      return;
+    }
+
+    const submittedHash = hashResetSecret(challenge.salt, code);
+    if (!constantTimeHexEqual(submittedHash, challenge.codeHash)) {
+      res.status(401).json({
+        error: `Incorrect verification code. ${Math.max(0, 5 - challenge.attempts)} attempt(s) remaining.`,
+      });
+      return;
+    }
+
+    const recoveryToken = crypto.randomBytes(32).toString('hex');
+    challenge.verified = true;
+    challenge.recoveryTokenHash = hashResetSecret(challenge.salt, recoveryToken);
+    challenge.expiresAt = Date.now() + 10 * 60 * 1000;
+
+    res.json({ verified: true, recoveryToken });
+  });
+
+  app.post('/api/auth/forgot-password/complete', (req: Request, res: Response) => {
+    const rawEmail = String(req.body?.email ?? '').trim().toLowerCase();
+    const recoveryToken = String(req.body?.recoveryToken ?? '').trim();
+    const action = req.body?.action === 'reset_password' ? 'reset_password' : 'enter_app';
+    const newPassword = String(req.body?.newPassword ?? '');
+
+    if (!rawEmail || !recoveryToken) {
+      res.status(400).json({ error: 'Missing email or recovery verification token.' });
+      return;
+    }
+
+    const challenge = resetChallenges.get(rawEmail);
+    if (!challenge || !challenge.verified || !challenge.recoveryTokenHash) {
+      res.status(401).json({ error: 'Recovery session expired or invalid. Please request a new code.' });
+      return;
+    }
+
+    if (Date.now() > challenge.expiresAt) {
+      resetChallenges.delete(rawEmail);
+      res.status(401).json({ error: 'Recovery session has expired. Please request a new code.' });
+      return;
+    }
+
+    const submittedTokenHash = hashResetSecret(challenge.salt, recoveryToken);
+    if (!constantTimeHexEqual(submittedTokenHash, challenge.recoveryTokenHash)) {
+      res.status(401).json({ error: 'Invalid recovery token.' });
+      return;
+    }
+
+    const db = getDb();
+    const user = db.users.find((u) => u.id === challenge.userId);
+    if (!user || user.status === 'suspended') {
+      resetChallenges.delete(rawEmail);
+      res.status(403).json({ error: 'Account not available.' });
+      return;
+    }
+
+    if (action === 'reset_password') {
+      if (newPassword.length < 6 || newPassword.length > 128) {
+        res.status(400).json({ error: 'New password must be between 6 and 128 characters.' });
+        return;
+      }
+      user.passwordHash = hashPasswordScrypt(newPassword);
+      saveDatabase();
+    }
+
+    resetChallenges.delete(rawEmail);
     res.json({ user: sanitizeUser(user) });
   });
 
@@ -810,7 +1038,7 @@ async function startServer() {
       id: `usr_${crypto.randomUUID().slice(0, 8)}`,
       name: String(name).trim(),
       email: normalizedEmail,
-      passwordHash: hashPassword('printhaus123'),
+      passwordHash: hashPasswordScrypt('printhaus123'),
       department: String(department || 'Print Operations'),
       matricNumber: matricNumber ? String(matricNumber).trim() : undefined,
       residency: residency === 'on-campus' ? 'on-campus' : 'off-campus',
