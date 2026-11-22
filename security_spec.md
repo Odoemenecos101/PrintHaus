@@ -1,10 +1,10 @@
 # PrintHaus Firestore Security Specification
 
 ## 1. Data Invariants
-1. A `/users/{userId}` document can only be created or read by the authenticated owner (`userId == request.auth.uid`) with a verified email (`request.auth.token.email_verified == true`) or by a trusted admin (`isAdmin()`).
+1. A `/users/{userId}` document can only be created or read by the authenticated owner (`userId == request.auth.uid`) using a verified email (`email_verified == true`) or Firebase `password` provider, or by a trusted admin (`isAdmin()`, which strictly requires `email_verified == true` or `/admins/{uid}` membership).
 2. A user creating their own `/users/{userId}` document MUST set `role == 'student'`, `roles == ['student']` (when present), and `status == 'active'`, preventing self-assigned privilege escalation (`staff` or `admin`).
 3. A user updating their own `/users/{userId}` profile may ONLY modify mutable profile fields (`name`, `matricNumber`, `school`, `department`, `residency`, `hostelGender`, `hostelName`, `updatedAt`); `uid`, `email`, `role`, `roles`, `status`, and `createdAt` are immutable for non-admins.
-4. An `/orders/{orderId}` document can only be created by an authenticated verified user where `incoming().studentUid == request.auth.uid`, with an opaque immutable `qrReference` (up to 64 chars, no PII/URLs), and can only be read/listed by the owning student (`resource.data.studentUid == request.auth.uid`) or an admin (`isAdmin()`).
+4. An `/orders/{orderId}` document can only be created by an authenticated owner (`email_verified == true` or Firebase `password` provider) where `incoming().studentUid == request.auth.uid`, with an opaque immutable `qrReference` (up to 64 chars, no PII/URLs), and can only be read/listed by the owning student (`resource.data.studentUid == request.auth.uid`) or an admin (`isAdmin()`).
 5. All `createdAt` and `updatedAt` timestamps MUST equal `request.time` (`serverTimestamp()`), and terminal order statuses (`collected`, `rejected`) lock further non-admin updates.
 
 ## 2. Adversarial Test Payloads ("Dirty Dozen")

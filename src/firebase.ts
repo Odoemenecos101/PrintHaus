@@ -153,6 +153,15 @@ export async function fetchFirestoreUserProfile(uid: string): Promise<UserAccoun
   }
 }
 
+export class MissingFirestoreProfileError extends Error {
+  firebaseUser: FirebaseUser;
+  constructor(firebaseUser: FirebaseUser) {
+    super('Your PrintHaus profile needs to be completed before continuing.');
+    this.name = 'MissingFirestoreProfileError';
+    this.firebaseUser = firebaseUser;
+  }
+}
+
 export async function loginWithEmailPassword(
   email: string,
   password: string
@@ -166,10 +175,7 @@ export async function loginWithEmailPassword(
   const profile = await fetchFirestoreUserProfile(credential.user.uid);
 
   if (!profile) {
-    await signOut(auth);
-    throw new Error(
-      'Your PrintHaus profile was not found. Please register first.'
-    );
+    throw new MissingFirestoreProfileError(credential.user);
   }
 
   return profile;
@@ -246,21 +252,59 @@ export async function registerEmailPasswordUser(
   password: string,
   input: CreateFirestoreProfileInput
 ): Promise<UserAccount> {
-  const credential = await createUserWithEmailAndPassword(
-    auth,
-    email.trim(),
-    password
-  );
-
+  const cleanEmail = email.trim().toLowerCase();
   const cleanName = input.name.trim();
 
-  if (cleanName) {
-    await updateProfile(credential.user, {
-      displayName: cleanName,
-    });
-  }
+  try {
+    const credential = await createUserWithEmailAndPassword(
+      auth,
+      cleanEmail,
+      password
+    );
 
-  return createFirestoreUserProfile(credential.user, input);
+    if (cleanName) {
+      await updateProfile(credential.user, {
+        displayName: cleanName,
+      });
+    }
+
+    return createFirestoreUserProfile(credential.user, input);
+  } catch (err: unknown) {
+    const code =
+      err && typeof err === 'object' && 'code' in err
+        ? String((err as { code?: string }).code)
+        : '';
+
+    if (code === 'auth/email-already-in-use') {
+      // Recover incomplete registrations where Firebase Auth succeeded previously but Firestore profile failed
+      try {
+        const existingCred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+        const existingProfile = await fetchFirestoreUserProfile(existingCred.user.uid);
+        if (existingProfile) {
+          await signOut(auth);
+          throw new Error('This PAU email is already registered. Please sign in instead.');
+        }
+        if (cleanName) {
+          await updateProfile(existingCred.user, {
+            displayName: cleanName,
+          }).catch(() => {});
+        }
+        return createFirestoreUserProfile(existingCred.user, input);
+      } catch (recoveryErr: unknown) {
+        if (
+          recoveryErr instanceof Error &&
+          recoveryErr.message.includes('already registered')
+        ) {
+          throw recoveryErr;
+        }
+        throw new Error(
+          'An account with this email already exists. Switch to Sign In or use Forgot Password.'
+        );
+      }
+    }
+
+    throw err;
+  }
 }
 
 

@@ -17,6 +17,13 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
+    function isActiveAuthAccount() {
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.firebase.sign_in_provider == 'password'
+      );
+    }
+
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
@@ -185,7 +192,7 @@ service cloud.firestore {
       allow list: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
 
       allow create: if isValidId(userId)
-        && isVerifiedUser()
+        && isActiveAuthAccount()
         && isOwner(userId)
         && isValidUserProfile(incoming())
         && incoming().uid == userId
@@ -204,7 +211,7 @@ service cloud.firestore {
             && incoming().createdAt == existing().createdAt
             && incoming().updatedAt == request.time
           ) || (
-            isVerifiedUser()
+            isActiveAuthAccount()
             && isOwner(userId)
             && incoming().uid == existing().uid
             && incoming().email == existing().email
@@ -248,7 +255,7 @@ service cloud.firestore {
       allow list: if isSignedIn() && (resource.data.studentUid == request.auth.uid || isAdmin());
 
       allow create: if isValidId(orderId)
-        && isVerifiedUser()
+        && isActiveAuthAccount()
         && isValidOrderRecord(incoming())
         && incoming().id == orderId
         && incoming().studentUid == request.auth.uid
@@ -274,7 +281,7 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           isAdmin() || (
-            isVerifiedUser()
+            isActiveAuthAccount()
             && existing().studentUid == request.auth.uid
             && !(existing().status in ['collected', 'rejected'])
             && incoming().diff(existing()).affectedKeys().hasOnly([

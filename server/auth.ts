@@ -77,8 +77,9 @@ export function extractBearerToken(req: Request): string | null {
 function findOrProvisionFirebaseUser(
   uid: string,
   email: string,
+  emailVerified: boolean,
   displayName?: string
-): UserAccount {
+): UserAccount | null {
   const db = getDb();
   const normalizedEmail = email.trim().toLowerCase();
 
@@ -91,10 +92,19 @@ function findOrProvisionFirebaseUser(
 
   const byEmail = db.users.find((u) => u.email.toLowerCase() === normalizedEmail);
   if (byEmail) {
+    const existingRoles = getUserRoles(byEmail);
+    const hasPrivilegedOrPasswordAccount =
+      existingRoles.includes('staff') ||
+      existingRoles.includes('admin') ||
+      Boolean(byEmail.passwordHash);
+    if (!emailVerified && hasPrivilegedOrPasswordAccount) {
+      return null;
+    }
+
     // Link pre-created / admin-assigned staff or student account to the verified Firebase UID
     const previousId = byEmail.id;
     byEmail.id = uid;
-    byEmail.roles = getUserRoles(byEmail);
+    byEmail.roles = existingRoles;
     byEmail.role = getPrimaryRole(byEmail.roles);
     if (displayName && !byEmail.name) {
       byEmail.name = displayName.trim();
@@ -113,7 +123,8 @@ function findOrProvisionFirebaseUser(
   }
 
   // Brand-new Firebase user: strictly student role only unless matched above
-  const isBootstrappedAdmin = normalizedEmail === 'chukwuemekaodoemene@gmail.com';
+  const isBootstrappedAdmin =
+    emailVerified && normalizedEmail === 'chukwuemekaodoemene@gmail.com';
   const roles: UserRole[] = isBootstrappedAdmin ? ['admin', 'student'] : ['student'];
   const newUser: UserAccount = {
     id: uid,
@@ -154,7 +165,13 @@ export async function authenticateRequest(req: Request): Promise<{
     const decoded = await verifyFirebaseBearerToken(token);
     const email = (decoded.email || '').trim().toLowerCase();
     if (!decoded.uid || !email) return null;
-    const user = findOrProvisionFirebaseUser(decoded.uid, email, decoded.name);
+    const user = findOrProvisionFirebaseUser(
+      decoded.uid,
+      email,
+      Boolean(decoded.email_verified),
+      decoded.name
+    );
+    if (!user) return null;
     return { user, provider: 'firebase' };
   } catch {
     return null;

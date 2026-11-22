@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { User as FirebaseUser, signInWithPopup, signOut } from 'firebase/auth';
 import { ArrowLeft, ArrowRight, CheckCircle2, Eye, EyeOff, KeyRound, Mail, X } from 'lucide-react';
 import {
+  MissingFirestoreProfileError,
   auth,
   createFirestoreUserProfile,
   fetchFirestoreUserProfile,
@@ -227,6 +228,14 @@ const handleLogin = async (loginEmail: string, loginPass: string) => {
         onAuthenticated(synced);
         return;
       } catch (fbErr: unknown) {
+        if (fbErr instanceof MissingFirestoreProfileError) {
+          setPendingGoogleUser(fbErr.firebaseUser);
+          setName(fbErr.firebaseUser.displayName || '');
+          setEmail(fbErr.firebaseUser.email || loginEmail.trim());
+          setMode('complete-google');
+          setError(null);
+          return;
+        }
         const code =
           fbErr && typeof fbErr === 'object' && 'code' in fbErr
             ? String((fbErr as { code?: string }).code)

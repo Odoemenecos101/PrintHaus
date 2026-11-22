@@ -96,7 +96,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!authReady || !firebaseUser) return;
+    if (!authReady || !firebaseUser || authModalOpen) return;
+    if (currentUser && currentUser.id === firebaseUser.uid) return;
     let active = true;
     (async () => {
       try {

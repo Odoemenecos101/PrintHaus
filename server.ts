@@ -356,6 +356,18 @@ async function startServer() {
       }
 
       if (existing.id !== cleanUid) {
+        const existingRoles = getUserRoles(existing);
+        const hasPrivilegedOrPassword =
+          existingRoles.includes('staff') ||
+          existingRoles.includes('admin') ||
+          Boolean(existing.passwordHash);
+        if (!decoded.email_verified && hasPrivilegedOrPassword) {
+          res.status(403).json({
+            error: 'This email is already registered. Please sign in with your existing password or verified Google account.',
+          });
+          return;
+        }
+
         const previousId = existing.id;
         existing.id = cleanUid;
         for (const order of db.orders) {
@@ -399,7 +411,8 @@ async function startServer() {
       return;
     }
 
-    const isBootstrappedAdmin = normalizedEmail === 'chukwuemekaodoemene@gmail.com';
+    const isBootstrappedAdmin =
+      Boolean(decoded.email_verified) && normalizedEmail === 'chukwuemekaodoemene@gmail.com';
     const roles: UserRole[] = isBootstrappedAdmin ? ['admin', 'student'] : ['student'];
     const createdUser: UserAccount = {
       id: cleanUid,
