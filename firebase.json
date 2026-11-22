@@ -1,0 +1,9 @@
+
+{
+  "firestore": [
+    {
+      "database": "ai-studio-printhaus-b2fda912-3286-442b-b9d0-5c5140031799",
+      "rules": "firestore.rules"
+    }
+  ]
+}
