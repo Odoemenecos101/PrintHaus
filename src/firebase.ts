@@ -31,7 +31,10 @@ import {
   PrintOrder,
   ResidencyType,
   UserAccount,
+  UserRole,
+  getPrimaryRole,
   getSchoolForProgramme,
+  normalizeRoles,
 } from './types/printhaus';
 
 const app = initializeApp(firebaseConfig);
@@ -120,6 +123,13 @@ export async function fetchFirestoreUserProfile(uid: string): Promise<UserAccoun
     const snap = await getDoc(doc(db, 'users', uid));
     if (!snap.exists()) return null;
     const data = snap.data();
+    const rawRoles = Array.isArray(data.roles)
+      ? (data.roles as UserRole[])
+      : undefined;
+    const roles = normalizeRoles(
+      rawRoles,
+      data.role === 'staff' || data.role === 'admin' ? data.role : 'student'
+    );
     return {
       id: String(data.uid || uid),
       name: String(data.name || ''),
@@ -133,8 +143,8 @@ export async function fetchFirestoreUserProfile(uid: string): Promise<UserAccoun
           ? data.hostelGender
           : undefined,
       hostelName: data.hostelName ? String(data.hostelName) : undefined,
-      role:
-        data.role === 'staff' || data.role === 'admin' ? data.role : 'student',
+      role: getPrimaryRole(roles),
+      roles,
       status: data.status === 'suspended' ? 'suspended' : 'active',
       createdAt: timestampToIso(data.createdAt),
     };
@@ -196,6 +206,7 @@ export async function createFirestoreUserProfile(
     department: cleanDept,
     residency: input.residency === 'on-campus' ? 'on-campus' : 'off-campus',
     role: 'student',
+    roles: ['student'],
     status: 'active',
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -221,6 +232,7 @@ export async function createFirestoreUserProfile(
       hostelGender: payload.hostelGender as HostelGender | undefined,
       hostelName: payload.hostelName as string | undefined,
       role: 'student',
+      roles: ['student'],
       status: 'active',
       createdAt: new Date().toISOString(),
     };
@@ -274,6 +286,7 @@ export async function syncOrderToFirestore(
         id: order.id.slice(0, 128),
         orderCode: order.orderCode.slice(0, 32),
         collectionCode: order.collectionCode.slice(0, 32),
+        qrReference: order.qrReference.slice(0, 64),
         studentUid: firebaseUid.slice(0, 128),
         studentId: order.studentId.slice(0, 128),
         studentName: order.studentName.slice(0, 120),
@@ -340,6 +353,7 @@ export async function fetchOrdersFromFirestore(firebaseUid: string): Promise<Pri
         id: String(d.id || docSnap.id),
         orderCode: String(d.orderCode || ''),
         collectionCode: String(d.collectionCode || ''),
+        qrReference: String(d.qrReference || d.collectionCode || d.orderCode || ''),
         studentId: String(d.studentId || firebaseUid),
         studentName: String(d.studentName || ''),
         studentEmail: String(d.studentEmail || ''),
@@ -413,29 +427,51 @@ export async function fetchOrdersFromFirestore(firebaseUid: string): Promise<Pri
   }
 }
 
-export async function syncFirebaseUserWithServer(profile: UserAccount): Promise<UserAccount> {
-  try {
-    const res = await fetch('/api/auth/firebase-sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        uid: profile.id,
-        name: profile.name,
-        email: profile.email,
-        matricNumber: profile.matricNumber,
-        school: profile.school,
-        department: profile.department,
-        residency: profile.residency,
-        hostelGender: profile.hostelGender,
-        hostelName: profile.hostelName,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.user) return data.user as UserAccount;
-    }
-  } catch {
-    // Fallback to Firestore profile directly if backend sync is temporarily unavailable
+export async function syncFirebaseUserWithServer(
+  profile: UserAccount,
+  overrideIdToken?: string
+): Promise<UserAccount> {
+  const token = overrideIdToken || (await auth.currentUser?.getIdToken().catch(() => null));
+  if (!token) {
+    return {
+      ...profile,
+      roles: normalizeRoles(profile.roles, profile.role),
+    };
   }
-  return profile;
+
+  const res = await fetch('/api/auth/firebase-sync', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      name: profile.name,
+      matricNumber: profile.matricNumber,
+      school: profile.school,
+      department: profile.department,
+      residency: profile.residency,
+      hostelGender: profile.hostelGender,
+      hostelName: profile.hostelName,
+    }),
+  });
+
+  if (res.status === 403) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(
+      errData.error || 'This account has been deactivated or suspended. Contact PrintHaus Admin.'
+    );
+  }
+
+  if (res.ok) {
+    const data = await res.json();
+    if (data.user) {
+      return data.user as UserAccount;
+    }
+  }
+
+  return {
+    ...profile,
+    roles: normalizeRoles(profile.roles, profile.role),
+  };
 }

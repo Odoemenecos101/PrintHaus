@@ -9,6 +9,7 @@ import {
   Search,
 } from 'lucide-react';
 import { auth, fetchOrdersFromFirestore } from '../firebase';
+import { apiFetch } from '../lib/api';
 import { PrintOrder, formatNaira } from '../types/printhaus';
 import { QrCodeBox } from './QrCodeBox';
 import { StatusBadge, StatusPipeline } from './StatusPipeline';
@@ -59,7 +60,9 @@ export function OrderHistory({
       else if (parentOrders.length === 0) setLoading(true);
       setFetchError(null);
       try {
-        const res = await fetch(`/api/orders?studentId=${encodeURIComponent(studentId)}`);
+        const res = await apiFetch(
+          `/api/orders?scope=student&studentId=${encodeURIComponent(studentId)}`
+        );
         const data = await res.json();
         if (!res.ok) {
           setFetchError(data.error || 'Could not load order history.');
@@ -473,8 +476,29 @@ export function OrderHistory({
                     {displayedActiveOrder.pickupShelf &&
                       ` · Shelf: ${displayedActiveOrder.pickupShelf}`}
                   </p>
+                  {displayedActiveOrder.status === 'collected' &&
+                    displayedActiveOrder.collectionRecord && (
+                      <div className="mt-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-[11px] text-emerald-900">
+                        Collected on{' '}
+                        <span className="font-mono font-semibold">
+                          {new Date(
+                            displayedActiveOrder.collectionRecord.collectedAt
+                          ).toLocaleString()}
+                        </span>{' '}
+                        · Confirmed by{' '}
+                        <span className="font-semibold">
+                          {displayedActiveOrder.collectionRecord.staffName}
+                        </span>
+                      </div>
+                    )}
                 </div>
-                <QrCodeBox value={displayedActiveOrder.collectionCode} size={104} downloadable />
+                <QrCodeBox
+                  value={displayedActiveOrder.qrReference || displayedActiveOrder.collectionCode}
+                  displayCode={`${displayedActiveOrder.orderCode} · ${displayedActiveOrder.collectionCode}`}
+                  size={104}
+                  downloadable
+                  enlargeable
+                />
               </div>
             </div>
           </div>

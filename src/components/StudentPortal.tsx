@@ -27,6 +27,7 @@ import {
   PricingConfig,
   SidedMode,
   UserAccount,
+  UserRole,
   calculateMultiDocumentOrderPricing,
   formatNaira,
 } from '../types/printhaus';
@@ -35,11 +36,14 @@ import {
   fetchOrdersFromFirestore,
   syncOrderToFirestore,
 } from '../firebase';
+import { apiFetch, buildAuthorizedDocumentUrl } from '../lib/api';
 import { OrderHistory } from './OrderHistory';
 import { QrCodeBox } from './QrCodeBox';
 
 interface StudentPortalProps {
   user: UserAccount;
+  availableRoles?: UserRole[];
+  onSelectDashboard?: (role: UserRole) => void;
   pricing: PricingConfig;
   onBackHome: () => void;
   onLogout: () => void;
@@ -61,6 +65,8 @@ interface PickupToast {
 
 export function StudentPortal({
   user,
+  availableRoles = ['student'],
+  onSelectDashboard,
   pricing,
   onBackHome,
   onLogout,
@@ -152,9 +158,30 @@ export function StudentPortal({
   const [orderSuccess, setOrderSuccess] = useState<PrintOrder | null>(null);
 
   // Preview, Receipt & Support modals
-  const [previewDocId, setPreviewDocId] = useState<{ id: string; name: string; mime: string } | null>(null);
+  const [previewDocId, setPreviewDocId] = useState<{
+    id: string;
+    name: string;
+    mime: string;
+    viewUrl: string;
+    downloadUrl: string;
+  } | null>(null);
   const [receiptOrder, setReceiptOrder] = useState<PrintOrder | null>(null);
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
+
+  const openDocumentPreview = useCallback(
+    async (docInfo: { id: string; name: string; mime: string }) => {
+      const [viewUrl, downloadUrl] = await Promise.all([
+        buildAuthorizedDocumentUrl(docInfo.id, false),
+        buildAuthorizedDocumentUrl(docInfo.id, true),
+      ]);
+      setPreviewDocId({
+        ...docInfo,
+        viewUrl,
+        downloadUrl,
+      });
+    },
+    []
+  );
 
   // Support ticket state
   const [supportOrderId, setSupportOrderId] = useState('');
@@ -193,9 +220,9 @@ export function StudentPortal({
   const loadStudentData = useCallback(async () => {
     try {
       const [ordRes, ntfRes, cmpRes] = await Promise.all([
-        fetch(`/api/orders?studentId=${encodeURIComponent(user.id)}`),
-        fetch(`/api/notifications?userId=${encodeURIComponent(user.id)}`),
-        fetch(`/api/complaints?studentId=${encodeURIComponent(user.id)}`),
+        apiFetch(`/api/orders?scope=student&studentId=${encodeURIComponent(user.id)}`),
+        apiFetch(`/api/notifications?userId=${encodeURIComponent(user.id)}`),
+        apiFetch(`/api/complaints?studentId=${encodeURIComponent(user.id)}`),
       ]);
       const ordData = await ordRes.json();
       const ntfData = await ntfRes.json();
@@ -268,7 +295,7 @@ export function StudentPortal({
         orders[0];
 
       if (!['ready_for_collection', 'collected', 'rejected'].includes(candidate.status)) {
-        const res = await fetch(`/api/orders/${candidate.id}/status`, {
+        const res = await apiFetch(`/api/orders/${candidate.id}/status`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -375,14 +402,14 @@ export function StudentPortal({
         reader.readAsDataURL(file);
       });
 
-      const res = await fetch('/api/documents/upload', {
+      const res = await apiFetch('/api/documents/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           fileName: file.name,
           mimeType: file.type || 'application/octet-stream',
           base64Data,
-          uploadedBy: user.id,
+          fallbackPageCount: manualPageCount,
         }),
       });
       const data = await res.json();
@@ -434,14 +461,10 @@ export function StudentPortal({
     setSubmittingOrder(true);
     setUploadError(null);
     try {
-      const res = await fetch('/api/orders', {
+      const res = await apiFetch('/api/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          studentId: user.id,
-          studentName: user.name,
-          studentEmail: user.email,
-          matricNumber: user.matricNumber,
           items: checkoutItems,
           paymentMethod,
           pickupVenue,
@@ -476,7 +499,7 @@ export function StudentPortal({
   };
 
   const handleMarkRead = async (id: string) => {
-    await fetch(`/api/notifications/${id}/read`, { method: 'PATCH' });
+    await apiFetch(`/api/notifications/${id}/read`, { method: 'PATCH' });
     setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, read: true } : n)));
   };
 
@@ -485,12 +508,11 @@ export function StudentPortal({
     if (!supportOrderId || !supportSubject || !supportDesc) return;
     setSupportSending(true);
     try {
-      const res = await fetch('/api/complaints', {
+      const res = await apiFetch('/api/complaints', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           orderId: supportOrderId,
-          studentId: user.id,
           subject: supportSubject,
           description: supportDesc,
         }),
@@ -604,12 +626,31 @@ export function StudentPortal({
         </div>
 
         <div className="hidden lg:block p-4 border-t border-slate-200 space-y-2">
+          {availableRoles.length > 1 && onSelectDashboard && (
+            <div className="space-y-1.5 pb-2 border-b border-slate-200">
+              <p className="text-[11px] font-medium text-slate-500">Switch Dashboard</p>
+              <div className="grid grid-cols-1 gap-1">
+                {availableRoles
+                  .filter((r) => r !== 'student')
+                  .map((role) => (
+                    <button
+                      key={role}
+                      type="button"
+                      onClick={() => onSelectDashboard(role)}
+                      className="w-full py-2 px-3 text-xs font-semibold text-blue-900 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors cursor-pointer capitalize"
+                    >
+                      Open {role} Dashboard
+                    </button>
+                  ))}
+              </div>
+            </div>
+          )}
           <button
             type="button"
             onClick={onSwitchRole}
             className="w-full py-2 px-3 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
           >
-            Switch Demo Account
+            Switch Account
           </button>
           <button
             type="button"
@@ -638,7 +679,23 @@ export function StudentPortal({
             </span>
           </div>
 
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+            {availableRoles.length > 1 && onSelectDashboard && (
+              <div className="flex items-center gap-1.5">
+                {availableRoles
+                  .filter((r) => r !== 'student')
+                  .map((role) => (
+                    <button
+                      key={role}
+                      type="button"
+                      onClick={() => onSelectDashboard(role)}
+                      className="py-1.5 px-3 text-xs font-semibold text-blue-900 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 whitespace-nowrap cursor-pointer capitalize"
+                    >
+                      {role} View
+                    </button>
+                  ))}
+              </div>
+            )}
             <button
               type="button"
               onClick={onBackHome}
@@ -689,7 +746,13 @@ export function StudentPortal({
                       </button>
                     </div>
                   </div>
-                  <QrCodeBox value={orderSuccess.collectionCode} size={96} />
+                  <QrCodeBox
+                    value={orderSuccess.qrReference || orderSuccess.collectionCode}
+                    displayCode={`${orderSuccess.orderCode} · ${orderSuccess.collectionCode}`}
+                    size={96}
+                    downloadable
+                    enlargeable
+                  />
                 </div>
               )}
 
@@ -708,7 +771,7 @@ export function StudentPortal({
                         <button
                           type="button"
                           onClick={() =>
-                            setPreviewDocId({
+                            void openDocumentPreview({
                               id: uploadedDoc.id,
                               name: uploadedDoc.fileName,
                               mime: uploadedDoc.mimeType,
@@ -1086,7 +1149,7 @@ export function StudentPortal({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    setPreviewDocId({
+                                    void openDocumentPreview({
                                       id: item.documentId,
                                       name: item.fileName,
                                       mime: item.fileType,
@@ -1258,7 +1321,7 @@ export function StudentPortal({
               onSelectOrder={setSelectedOrderId}
               onOrdersLoaded={setOrders}
               onCreateFirstOrder={() => setActiveTab('new-order')}
-              onPreviewDocument={setPreviewDocId}
+              onPreviewDocument={(docInfo) => void openDocumentPreview(docInfo)}
               onOpenReceipt={setReceiptOrder}
               onSimulateReadyForPickup={handleSimulateReadyForPickup}
               simulatingPickup={simulatingPickup}
@@ -1444,7 +1507,7 @@ export function StudentPortal({
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <a
-                  href={`/api/documents/${previewDocId.id}/file?download=1`}
+                  href={previewDocId.downloadUrl}
                   className="py-1.5 px-3 text-xs font-medium border border-slate-300 rounded-lg hover:bg-slate-50"
                 >
                   Download
@@ -1462,12 +1525,12 @@ export function StudentPortal({
               {previewDocId.mime.includes('pdf') || previewDocId.name.toLowerCase().endsWith('.pdf') ? (
                 <iframe
                   title={previewDocId.name}
-                  src={`/api/documents/${previewDocId.id}/file`}
+                  src={previewDocId.viewUrl}
                   className="w-full h-[65vh] border-0"
                 />
               ) : previewDocId.mime.startsWith('image/') ? (
                 <img
-                  src={`/api/documents/${previewDocId.id}/file`}
+                  src={previewDocId.viewUrl}
                   alt={previewDocId.name}
                   className="max-h-[65vh] object-contain p-4"
                 />
@@ -1548,7 +1611,11 @@ export function StudentPortal({
                 </span>
               </div>
               <div className="pt-2 flex justify-center">
-                <QrCodeBox value={receiptOrder.collectionCode} size={96} />
+                <QrCodeBox
+                  value={receiptOrder.qrReference || receiptOrder.collectionCode}
+                  displayCode={`${receiptOrder.orderCode} · ${receiptOrder.collectionCode}`}
+                  size={96}
+                />
               </div>
               <button
                 type="button"

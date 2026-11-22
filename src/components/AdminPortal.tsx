@@ -1,24 +1,34 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   BarChart3,
   Building2,
+  Eye,
+  EyeOff,
   LogOut,
   MessageSquareWarning,
+  Search,
   Sliders,
+  UserPlus,
   Users,
 } from 'lucide-react';
+import { apiFetch } from '../lib/api';
 import {
+  CollectionHistoryEntry,
   ComplaintTicket,
   PrintOrder,
   PricingConfig,
   PrintingPartner,
   UserAccount,
+  UserRole,
   formatNaira,
+  getUserRoles,
 } from '../types/printhaus';
 import { StatusBadge } from './StatusPipeline';
 
 interface AdminPortalProps {
   user: UserAccount;
+  availableRoles?: UserRole[];
+  onSelectDashboard?: (role: UserRole) => void;
   pricing: PricingConfig;
   onPricingUpdated: (next: PricingConfig) => void;
   onBackHome: () => void;
@@ -42,8 +52,18 @@ interface AdminMetrics {
   openComplaints: number;
 }
 
+interface StaffRosterMember extends UserAccount {
+  collectionStats: {
+    totalCollections: number;
+    lastCollectedAt: string | null;
+    recentCollections: CollectionHistoryEntry[];
+  };
+}
+
 export function AdminPortal({
   user,
+  availableRoles = ['admin'],
+  onSelectDashboard,
   pricing,
   onPricingUpdated,
   onBackHome,
@@ -55,44 +75,57 @@ export function AdminPortal({
   const [orders, setOrders] = useState<PrintOrder[]>([]);
   const [partners, setPartners] = useState<PrintingPartner[]>([]);
   const [users, setUsers] = useState<UserAccount[]>([]);
+  const [staffRoster, setStaffRoster] = useState<StaffRosterMember[]>([]);
+  const [recentCollections, setRecentCollections] = useState<CollectionHistoryEntry[]>([]);
   const [complaints, setComplaints] = useState<ComplaintTicket[]>([]);
   const [draftPricing, setDraftPricing] = useState<PricingConfig>(pricing);
   const [pricingSaved, setPricingSaved] = useState(false);
 
-  // New staff form
+  // Staff & Multi-role management state
   const [newName, setNewName] = useState('');
   const [newEmail, setNewEmail] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const [newDept, setNewDept] = useState('Campus Pickup Desk');
+  const [newRoles, setNewRoles] = useState<UserRole[]>(['staff']);
+  const [staffSearch, setStaffSearch] = useState('');
+  const [accountNotice, setAccountNotice] = useState<string | null>(null);
+  const [accountError, setAccountError] = useState<string | null>(null);
+  const [savingAccount, setSavingAccount] = useState(false);
 
   // Refund / resolution state
   const [resolutionMap, setResolutionMap] = useState<Record<string, string>>({});
   const [refundMap, setRefundMap] = useState<Record<string, number>>({});
 
-  const loadAdminData = async () => {
-    const [ovRes, ordRes, ptrRes, usrRes, cmpRes] = await Promise.all([
-      fetch('/api/admin/overview'),
-      fetch('/api/orders'),
-      fetch('/api/admin/partners'),
-      fetch('/api/admin/users'),
-      fetch('/api/complaints'),
+  const loadAdminData = useCallback(async () => {
+    const [ovRes, ordRes, ptrRes, usrRes, stfRes, cmpRes] = await Promise.all([
+      apiFetch('/api/admin/overview'),
+      apiFetch('/api/orders'),
+      apiFetch('/api/admin/partners'),
+      apiFetch('/api/admin/users'),
+      apiFetch(`/api/admin/staff${staffSearch.trim() ? `?q=${encodeURIComponent(staffSearch.trim())}` : ''}`),
+      apiFetch('/api/complaints'),
     ]);
-    const [ovData, ordData, ptrData, usrData, cmpData] = await Promise.all([
-      ovRes.json(),
-      ordRes.json(),
-      ptrRes.json(),
-      usrRes.json(),
-      cmpRes.json(),
+    const [ovData, ordData, ptrData, usrData, stfData, cmpData] = await Promise.all([
+      ovRes.json().catch(() => ({})),
+      ordRes.json().catch(() => ({})),
+      ptrRes.json().catch(() => ({})),
+      usrRes.json().catch(() => ({})),
+      stfRes.json().catch(() => ({})),
+      cmpRes.json().catch(() => ({})),
     ]);
-    setMetrics(ovData.metrics);
+    if (ovData.metrics) setMetrics(ovData.metrics);
     setOrders(ordData.orders || []);
     setPartners(ptrData.partners || []);
     setUsers(usrData.users || []);
+    setStaffRoster(stfData.staff || []);
+    setRecentCollections(stfData.recentCollections || []);
     setComplaints(cmpData.complaints || []);
-  };
+  }, [staffSearch]);
 
   useEffect(() => {
-    loadAdminData();
-  }, []);
+    void loadAdminData();
+  }, [loadAdminData]);
 
   useEffect(() => {
     setDraftPricing(pricing);
@@ -100,7 +133,7 @@ export function AdminPortal({
 
   const handleSavePricing = async (e: React.FormEvent) => {
     e.preventDefault();
-    const res = await fetch('/api/pricing', {
+    const res = await apiFetch('/api/pricing', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(draftPricing),
@@ -114,7 +147,7 @@ export function AdminPortal({
   };
 
   const handlePartnerStatus = async (id: string, status: PrintingPartner['status']) => {
-    await fetch(`/api/admin/partners/${id}`, {
+    await apiFetch(`/api/admin/partners/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status }),
@@ -122,38 +155,106 @@ export function AdminPortal({
     await loadAdminData();
   };
 
-  const handleAddStaff = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newName || !newEmail) return;
-    const res = await fetch('/api/admin/users', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: newName,
-        email: newEmail,
-        department: newDept,
-        role: 'staff',
-      }),
+  const toggleNewRole = (role: UserRole) => {
+    setNewRoles((prev) => {
+      if (prev.includes(role)) {
+        return prev.length > 1 ? prev.filter((r) => r !== role) : prev;
+      }
+      return [...prev, role];
     });
-    if (res.ok) {
+  };
+
+  const handleAddOrGrantStaff = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newEmail.trim()) return;
+    setAccountError(null);
+    setAccountNotice(null);
+    setSavingAccount(true);
+    try {
+      const res = await apiFetch('/api/admin/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: newName.trim(),
+          email: newEmail.trim(),
+          password: newPassword.trim() || undefined,
+          department: newDept.trim(),
+          roles: newRoles,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAccountError(data.error || 'Could not save staff account.');
+        return;
+      }
+      setAccountNotice(
+        data.mergedExisting
+          ? `Updated existing account (${data.user.email}) with roles: ${getUserRoles(data.user).join(', ')}. No duplicate created.`
+          : `Created account for ${data.user.name} (${data.user.email}) with roles: ${getUserRoles(data.user).join(', ')}.`
+      );
       setNewName('');
       setNewEmail('');
+      setNewPassword('');
+      setNewRoles(['staff']);
       await loadAdminData();
+    } finally {
+      setSavingAccount(false);
     }
   };
 
+  const handleToggleUserRole = async (target: UserAccount, roleToToggle: UserRole) => {
+    setAccountError(null);
+    setAccountNotice(null);
+    const current = getUserRoles(target);
+    let next: UserRole[];
+    if (current.includes(roleToToggle)) {
+      if (current.length === 1) {
+        setAccountError('Every account must keep at least one role. Use Suspend to deactivate instead.');
+        return;
+      }
+      next = current.filter((r) => r !== roleToToggle);
+    } else {
+      next = [...current, roleToToggle];
+    }
+
+    const res = await apiFetch(`/api/admin/users/${target.id}/roles`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roles: next }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setAccountError(data.error || 'Could not update roles.');
+      return;
+    }
+    setAccountNotice(
+      `Updated roles for ${target.name} (${target.email}): ${getUserRoles(data.user).join(', ')}.`
+    );
+    await loadAdminData();
+  };
+
   const handleToggleUserStatus = async (u: UserAccount) => {
+    setAccountError(null);
+    setAccountNotice(null);
     const nextStatus = u.status === 'active' ? 'suspended' : 'active';
-    await fetch(`/api/admin/users/${u.id}`, {
+    const res = await apiFetch(`/api/admin/users/${u.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: nextStatus }),
     });
+    const data = await res.json();
+    if (!res.ok) {
+      setAccountError(data.error || 'Could not update account status.');
+      return;
+    }
+    setAccountNotice(
+      `${u.name} (${u.email}) is now ${nextStatus === 'active' ? 'active' : 'deactivated'}.`
+    );
     await loadAdminData();
   };
 
   const handleResolveComplaint = async (c: ComplaintTicket, status: 'resolved' | 'refunded') => {
-    await fetch(`/api/complaints/${c.id}`, {
+    await apiFetch(`/api/complaints/${c.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -166,6 +267,16 @@ export function AdminPortal({
     });
     await loadAdminData();
   };
+
+  const filteredDirectoryUsers = users.filter((u) => {
+    const q = staffSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      u.name.toLowerCase().includes(q) ||
+      u.email.toLowerCase().includes(q) ||
+      (u.department || '').toLowerCase().includes(q)
+    );
+  });
 
   return (
     <div className="min-h-screen bg-[#FAF9F6] text-slate-900 flex flex-col lg:flex-row">
@@ -185,6 +296,7 @@ export function AdminPortal({
 
           <div className="p-4 border-b border-slate-200">
             <p className="text-sm font-semibold text-slate-900 truncate">{user.name}</p>
+            <p className="text-[11px] font-mono text-slate-500 truncate mt-0.5">{user.email}</p>
             <p className="text-xs text-slate-500 mt-0.5">{user.department || 'Operations Lead'}</p>
           </div>
 
@@ -193,7 +305,7 @@ export function AdminPortal({
               { id: 'overview' as const, label: 'Revenue & Orders', icon: BarChart3 },
               { id: 'pricing' as const, label: 'Pricing Rules', icon: Sliders },
               { id: 'partners' as const, label: 'Printing Partners', icon: Building2 },
-              { id: 'accounts' as const, label: 'Accounts & Staff', icon: Users },
+              { id: 'accounts' as const, label: 'Staff & Multi-Role', icon: Users },
               { id: 'complaints' as const, label: 'Complaints & Refunds', icon: MessageSquareWarning },
             ].map((item) => {
               const Icon = item.icon;
@@ -217,12 +329,31 @@ export function AdminPortal({
         </div>
 
         <div className="hidden lg:block p-4 border-t border-slate-200 space-y-2">
+          {availableRoles.length > 1 && onSelectDashboard && (
+            <div className="space-y-1.5 pb-2 border-b border-slate-200">
+              <p className="text-[11px] font-medium text-slate-500">Switch Dashboard</p>
+              <div className="grid grid-cols-1 gap-1">
+                {availableRoles
+                  .filter((r) => r !== 'admin')
+                  .map((role) => (
+                    <button
+                      key={role}
+                      type="button"
+                      onClick={() => onSelectDashboard(role)}
+                      className="w-full py-2 px-3 text-xs font-semibold text-blue-900 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors cursor-pointer capitalize"
+                    >
+                      Open {role} Dashboard
+                    </button>
+                  ))}
+              </div>
+            </div>
+          )}
           <button
             type="button"
             onClick={onSwitchRole}
             className="w-full py-2 px-3 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
           >
-            Switch Demo Account
+            Switch Account
           </button>
           <button
             type="button"
@@ -241,15 +372,42 @@ export function AdminPortal({
           <div className="text-xs text-slate-500 flex items-center gap-2">
             <span>PrintHaus</span>
             <span>/</span>
-            <span className="text-slate-900 font-medium capitalize">{activeTab}</span>
+            <span className="text-slate-900 font-medium capitalize">
+              {activeTab === 'accounts' ? 'Staff & Multi-Role Management' : activeTab}
+            </span>
           </div>
-          <button
-            type="button"
-            onClick={onBackHome}
-            className="py-1.5 px-3 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-          >
-            Public Site
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {availableRoles.length > 1 && onSelectDashboard && (
+              <div className="flex items-center gap-1.5">
+                {availableRoles
+                  .filter((r) => r !== 'admin')
+                  .map((role) => (
+                    <button
+                      key={role}
+                      type="button"
+                      onClick={() => onSelectDashboard(role)}
+                      className="py-1.5 px-3 text-xs font-semibold text-blue-900 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 whitespace-nowrap cursor-pointer capitalize"
+                    >
+                      {role} View
+                    </button>
+                  ))}
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={onBackHome}
+              className="py-1.5 px-3 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+            >
+              Public Site
+            </button>
+            <button
+              type="button"
+              onClick={onLogout}
+              className="lg:hidden py-1.5 px-3 text-xs font-medium text-slate-700 border border-slate-200 rounded-lg cursor-pointer"
+            >
+              Sign Out
+            </button>
+          </div>
         </header>
 
         <main className="p-6 lg:p-8 max-w-7xl w-full mx-auto space-y-6">
@@ -267,7 +425,7 @@ export function AdminPortal({
                   </p>
                 </div>
                 <div className="p-5">
-                  <p className="text-xs text-slate-500">Partner & Operating Costs</p>
+                  <p className="text-xs text-slate-500">Partner &amp; Operating Costs</p>
                   <p className="font-display text-2xl font-bold font-mono tabular-nums text-slate-950 mt-1">
                     {formatNaira(metrics.partnerPayouts + metrics.packagingAndOperating)}
                   </p>
@@ -281,7 +439,7 @@ export function AdminPortal({
                     {formatNaira(metrics.netContribution)}
                   </p>
                   <p className="text-xs text-slate-500 mt-1">
-                    After partner, envelope & ops allocation
+                    After partner, envelope &amp; ops allocation
                   </p>
                 </div>
                 <div className="p-5">
@@ -298,7 +456,7 @@ export function AdminPortal({
               <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
                 <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
                   <h2 className="text-base font-semibold text-slate-900">
-                    All Campus Orders & Unit Economics
+                    All Campus Orders &amp; Unit Economics
                   </h2>
                   <span className="text-xs font-mono text-slate-500 tabular-nums">
                     {orders.length} records
@@ -359,7 +517,7 @@ export function AdminPortal({
               <div className="flex items-center justify-between pb-4 border-b border-slate-200">
                 <div>
                   <h2 className="text-base font-semibold text-slate-900">
-                    Platform Printing Prices & Discounts (₦)
+                    Platform Printing Prices &amp; Discounts (₦)
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
                     Changes update the public calculator and student checkout immediately
@@ -431,7 +589,7 @@ export function AdminPortal({
                     <select
                       value={p.status}
                       onChange={(e) =>
-                        handlePartnerStatus(p.id, e.target.value as PrintingPartner['status'])
+                        void handlePartnerStatus(p.id, e.target.value as PrintingPartner['status'])
                       }
                       className="px-2.5 py-1.5 text-xs font-medium border border-slate-300 rounded-lg bg-white"
                     >
@@ -447,7 +605,7 @@ export function AdminPortal({
                       <p className="font-semibold text-slate-900 mt-0.5">{p.turnaroundMinutes} mins</p>
                     </div>
                     <div>
-                      <span className="text-slate-500 font-sans">B&W Cost</span>
+                      <span className="text-slate-500 font-sans">B&amp;W Cost</span>
                       <p className="font-semibold text-slate-900 mt-0.5">{formatNaira(p.costPerBwPage)}/pg</p>
                     </div>
                     <div>
@@ -460,112 +618,374 @@ export function AdminPortal({
             </div>
           )}
 
-          {/* ACCOUNTS & STAFF */}
+          {/* ACCOUNTS, STAFF & MULTI-ROLE MANAGEMENT */}
           {activeTab === 'accounts' && (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              <form
-                onSubmit={handleAddStaff}
-                className="lg:col-span-4 p-6 bg-white border border-slate-200 rounded-xl space-y-4"
-              >
-                <h2 className="text-base font-semibold text-slate-900">Add Printing Staff</h2>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Full Name</label>
-                  <input
-                    type="text"
-                    required
-                    value={newName}
-                    onChange={(e) => setNewName(e.target.value)}
-                    placeholder="e.g. Samuel Bassey"
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-                  />
+            <div className="space-y-6">
+              {accountError && (
+                <div className="p-3.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
+                  {accountError}
                 </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Email</label>
-                  <input
-                    type="email"
-                    required
-                    value={newEmail}
-                    onChange={(e) => setNewEmail(e.target.value)}
-                    placeholder="samuel@printhaus.ng"
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-                  />
+              )}
+              {accountNotice && (
+                <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg text-xs text-emerald-900">
+                  {accountNotice}
                 </div>
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1">Station</label>
-                  <input
-                    type="text"
-                    value={newDept}
-                    onChange={(e) => setNewDept(e.target.value)}
-                    className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-                  />
-                </div>
-                <button
-                  type="submit"
-                  className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium rounded-lg cursor-pointer"
-                >
-                  Create Staff Account
-                </button>
-              </form>
+              )}
 
-              <div className="lg:col-span-8 bg-white border border-slate-200 rounded-xl overflow-hidden">
-                <div className="px-6 py-4 border-b border-slate-200">
-                  <h3 className="text-base font-semibold text-slate-900">
-                    Students & Operations Roster
-                  </h3>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs text-left">
-                    <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
-                      <tr>
-                        <th className="py-3 px-4">Name</th>
-                        <th className="py-3 px-4">Programme & Residence</th>
-                        <th className="py-3 px-4">Role</th>
-                        <th className="py-3 px-4">Status</th>
-                        <th className="py-3 px-4 text-right">Action</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200">
-                      {users.map((u) => (
-                        <tr key={u.id} className="h-12">
-                          <td className="px-4">
-                            <p className="font-medium text-slate-900">{u.name}</p>
-                            <p className="font-mono text-[11px] text-slate-500">{u.email}</p>
-                          </td>
-                          <td className="px-4 text-slate-700">
-                            <p>{u.department || '—'}</p>
-                            <p className="text-[11px] text-slate-500">
-                              {u.residency === 'on-campus'
-                                ? u.hostelName || 'On-Campus Hostel'
-                                : u.residency === 'off-campus'
-                                  ? 'Off-Campus'
-                                  : u.school || 'Operations'}
-                            </p>
-                          </td>
-                          <td className="px-4 uppercase font-mono">{u.role}</td>
-                          <td className="px-4">
-                            <span
-                              className={
-                                u.status === 'active' ? 'text-emerald-700 font-medium' : 'text-red-700 font-medium'
-                              }
-                            >
-                              {u.status}
-                            </span>
-                          </td>
-                          <td className="px-4 text-right">
-                            {u.id !== user.id && (
-                              <button
-                                type="button"
-                                onClick={() => handleToggleUserStatus(u)}
-                                className="px-2.5 py-1 border border-slate-300 rounded hover:bg-slate-100 cursor-pointer"
-                              >
-                                {u.status === 'active' ? 'Suspend' : 'Activate'}
-                              </button>
-                            )}
-                          </td>
-                        </tr>
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                {/* Create or Upgrade Staff Account */}
+                <form
+                  onSubmit={handleAddOrGrantStaff}
+                  className="lg:col-span-4 p-6 bg-white border border-slate-200 rounded-xl space-y-4"
+                >
+                  <div className="flex items-center gap-2">
+                    <UserPlus className="w-4 h-4 text-blue-800" />
+                    <h2 className="text-base font-semibold text-slate-900">
+                      Create or Grant Staff Access
+                    </h2>
+                  </div>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    Add a staff member using Gmail or any authorized email, or enter an existing student&apos;s <span className="font-mono">@pau.edu.ng</span> email to assign multiple roles without duplicating their account.
+                  </p>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Full Name (required for new accounts)
+                    </label>
+                    <input
+                      type="text"
+                      value={newName}
+                      onChange={(e) => setNewName(e.target.value)}
+                      placeholder="e.g. Samuel Bassey"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Authorized Email (Gmail, Staff, or PAU Email)
+                    </label>
+                    <input
+                      type="email"
+                      required
+                      value={newEmail}
+                      onChange={(e) => setNewEmail(e.target.value)}
+                      placeholder="samuel@gmail.com or student@pau.edu.ng"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Initial Password (optional for new account)
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showNewPassword ? 'text' : 'password'}
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        placeholder="Defaults to printhaus123 if blank"
+                        className="w-full pl-3 pr-10 py-2 text-sm border border-slate-300 rounded-lg"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowNewPassword((p) => !p)}
+                        aria-label={showNewPassword ? 'Hide password' : 'Show password'}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700 cursor-pointer"
+                      >
+                        {showNewPassword ? (
+                          <EyeOff className="w-4 h-4" />
+                        ) : (
+                          <Eye className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Station / Desk
+                    </label>
+                    <input
+                      type="text"
+                      value={newDept}
+                      onChange={(e) => setNewDept(e.target.value)}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                      Assigned Roles
+                    </label>
+                    <div className="grid grid-cols-3 gap-2 text-xs">
+                      {(['student', 'staff', 'admin'] as const).map((r) => (
+                        <label
+                          key={r}
+                          className={`flex items-center gap-1.5 px-2.5 py-2 border rounded-lg cursor-pointer capitalize ${
+                            newRoles.includes(r)
+                              ? 'border-blue-700 bg-blue-50 text-blue-900 font-semibold'
+                              : 'border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={newRoles.includes(r)}
+                            onChange={() => toggleNewRole(r)}
+                            className="accent-blue-800"
+                          />
+                          <span>{r}</span>
+                        </label>
                       ))}
-                    </tbody>
-                  </table>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={savingAccount}
+                    className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-medium rounded-lg cursor-pointer"
+                  >
+                    {savingAccount ? 'Saving...' : 'Save Staff / Role Assignment'}
+                  </button>
+                </form>
+
+                {/* Authorized Staff & Activity Table */}
+                <div className="lg:col-span-8 space-y-6">
+                  <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                    <div className="px-6 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-base font-semibold text-slate-900">
+                          Authorized Staff &amp; Collection Activity
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Search staff by name or email, manage multi-role permissions, or deactivate access immediately
+                        </p>
+                      </div>
+                      <div className="relative w-full sm:w-64">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={staffSearch}
+                          onChange={(e) => setStaffSearch(e.target.value)}
+                          placeholder="Search name or email..."
+                          className="w-full pl-8 pr-3 py-1.5 text-xs bg-white border border-slate-300 rounded-lg"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs text-left">
+                        <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+                          <tr>
+                            <th className="py-3 px-4">Staff Member</th>
+                            <th className="py-3 px-4">Roles</th>
+                            <th className="py-3 px-4">Collection Activity</th>
+                            <th className="py-3 px-4">Status</th>
+                            <th className="py-3 px-4 text-right">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                          {staffRoster.map((s) => {
+                            const roles = getUserRoles(s);
+                            return (
+                              <tr key={s.id} className="hover:bg-slate-50">
+                                <td className="py-3 px-4">
+                                  <p className="font-medium text-slate-900">{s.name}</p>
+                                  <p className="font-mono text-[11px] text-slate-500">{s.email}</p>
+                                  <p className="text-[11px] text-slate-500">{s.department || 'Print Desk'}</p>
+                                </td>
+                                <td className="py-3 px-4">
+                                  <div className="flex flex-wrap gap-1">
+                                    {(['student', 'staff', 'admin'] as const).map((r) => {
+                                      const active = roles.includes(r);
+                                      return (
+                                        <button
+                                          key={r}
+                                          type="button"
+                                          onClick={() => void handleToggleUserRole(s, r)}
+                                          title={`Click to ${active ? 'remove' : 'grant'} ${r} role`}
+                                          className={`px-2 py-0.5 rounded font-mono uppercase text-[10px] border cursor-pointer ${
+                                            active
+                                              ? 'bg-blue-50 text-blue-900 border-blue-300 font-semibold'
+                                              : 'bg-white text-slate-400 border-slate-200 hover:border-slate-400 hover:text-slate-700'
+                                          }`}
+                                        >
+                                          {active ? `✓ ${r}` : `+ ${r}`}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </td>
+                                <td className="py-3 px-4 font-mono tabular-nums">
+                                  <p className="font-semibold text-slate-900">
+                                    {s.collectionStats?.totalCollections ?? 0} confirmed
+                                  </p>
+                                  <p className="text-[11px] text-slate-500">
+                                    {s.collectionStats?.lastCollectedAt
+                                      ? `Last: ${new Date(s.collectionStats.lastCollectedAt).toLocaleString()}`
+                                      : 'No collections yet'}
+                                  </p>
+                                </td>
+                                <td className="py-3 px-4">
+                                  <span
+                                    className={
+                                      s.status === 'active'
+                                        ? 'text-emerald-700 font-semibold'
+                                        : 'text-red-700 font-semibold'
+                                    }
+                                  >
+                                    {s.status === 'active' ? 'Active' : 'Deactivated'}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
+                                  {roles.includes('staff') && s.id !== user.id && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleToggleUserRole(s, 'staff')}
+                                      className="px-2.5 py-1 text-[11px] font-medium text-amber-800 border border-amber-200 bg-amber-50 hover:bg-amber-100 rounded cursor-pointer"
+                                    >
+                                      Revoke Staff
+                                    </button>
+                                  )}
+                                  {s.id !== user.id && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleToggleUserStatus(s)}
+                                      className="px-2.5 py-1 text-[11px] font-medium border border-slate-300 rounded hover:bg-slate-100 cursor-pointer"
+                                    >
+                                      {s.status === 'active' ? 'Deactivate' : 'Reactivate'}
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* All Users / Assign Staff to Existing Students */}
+                  <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                    <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
+                      <div>
+                        <h3 className="text-base font-semibold text-slate-900">
+                          All Campus Accounts (Assign Multi-Role Permissions)
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Toggle roles directly on any existing PAU student to enable both Student and Staff dashboards under one login
+                        </p>
+                      </div>
+                      <span className="text-xs font-mono text-slate-500 tabular-nums">
+                        {filteredDirectoryUsers.length} user(s)
+                      </span>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs text-left">
+                        <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 font-semibold">
+                          <tr>
+                            <th className="py-3 px-4">User</th>
+                            <th className="py-3 px-4">Programme / Desk</th>
+                            <th className="py-3 px-4">Roles (Click to Toggle)</th>
+                            <th className="py-3 px-4">Status</th>
+                            <th className="py-3 px-4 text-right">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                          {filteredDirectoryUsers.map((u) => {
+                            const roles = getUserRoles(u);
+                            return (
+                              <tr key={u.id} className="h-12 hover:bg-slate-50">
+                                <td className="px-4 py-2.5">
+                                  <p className="font-medium text-slate-900">{u.name}</p>
+                                  <p className="font-mono text-[11px] text-slate-500">{u.email}</p>
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-700">
+                                  <p>{u.department || '—'}</p>
+                                  <p className="text-[11px] text-slate-500">
+                                    {u.residency === 'on-campus'
+                                      ? u.hostelName || 'On-Campus Hostel'
+                                      : u.residency === 'off-campus'
+                                        ? 'Off-Campus'
+                                        : u.school || 'Operations'}
+                                  </p>
+                                </td>
+                                <td className="px-4 py-2.5">
+                                  <div className="flex flex-wrap gap-1">
+                                    {(['student', 'staff', 'admin'] as const).map((r) => {
+                                      const active = roles.includes(r);
+                                      return (
+                                        <button
+                                          key={r}
+                                          type="button"
+                                          onClick={() => void handleToggleUserRole(u, r)}
+                                          className={`px-2 py-0.5 rounded font-mono uppercase text-[10px] border cursor-pointer ${
+                                            active
+                                              ? 'bg-blue-50 text-blue-900 border-blue-300 font-semibold'
+                                              : 'bg-white text-slate-400 border-slate-200 hover:border-slate-400 hover:text-slate-700'
+                                          }`}
+                                        >
+                                          {active ? `✓ ${r}` : `+ ${r}`}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </td>
+                                <td className="px-4 py-2.5">
+                                  <span
+                                    className={
+                                      u.status === 'active'
+                                        ? 'text-emerald-700 font-medium'
+                                        : 'text-red-700 font-medium'
+                                    }
+                                  >
+                                    {u.status}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-2.5 text-right">
+                                  {u.id !== user.id && (
+                                    <button
+                                      type="button"
+                                      onClick={() => void handleToggleUserStatus(u)}
+                                      className="px-2.5 py-1 border border-slate-300 rounded hover:bg-slate-100 cursor-pointer"
+                                    >
+                                      {u.status === 'active' ? 'Deactivate' : 'Activate'}
+                                    </button>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Recent Staff Collection Log */}
+                  {recentCollections.length > 0 && (
+                    <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+                      <div className="px-6 py-4 border-b border-slate-200">
+                        <h3 className="text-sm font-semibold text-slate-900">
+                          Recent Staff Collection Audit Feed
+                        </h3>
+                      </div>
+                      <div className="divide-y divide-slate-200">
+                        {recentCollections.slice(0, 6).map((c) => (
+                          <div
+                            key={c.id}
+                            className="px-6 py-3 flex items-center justify-between gap-4 text-xs"
+                          >
+                            <div>
+                              <span className="font-mono font-bold text-slate-900">
+                                {c.orderCode}
+                              </span>{' '}
+                              · {c.studentName} · Confirmed by{' '}
+                              <span className="font-semibold text-slate-900">{c.staffName}</span>
+                            </div>
+                            <span className="font-mono text-[11px] text-slate-500">
+                              {new Date(c.collectedAt).toLocaleString()}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -576,7 +996,7 @@ export function AdminPortal({
             <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
               <div className="px-6 py-4 border-b border-slate-200">
                 <h2 className="text-base font-semibold text-slate-900">
-                  Student Complaints & Refund Resolutions
+                  Student Complaints &amp; Refund Resolutions
                 </h2>
               </div>
               {complaints.length === 0 ? (
@@ -623,14 +1043,14 @@ export function AdminPortal({
                           />
                           <button
                             type="button"
-                            onClick={() => handleResolveComplaint(c, 'resolved')}
+                            onClick={() => void handleResolveComplaint(c, 'resolved')}
                             className="px-3 py-1.5 text-xs font-medium bg-slate-900 text-white rounded-lg cursor-pointer"
                           >
                             Resolve
                           </button>
                           <button
                             type="button"
-                            onClick={() => handleResolveComplaint(c, 'refunded')}
+                            onClick={() => void handleResolveComplaint(c, 'refunded')}
                             className="px-3 py-1.5 text-xs font-medium bg-red-700 text-white rounded-lg cursor-pointer"
                           >
                             Issue Refund

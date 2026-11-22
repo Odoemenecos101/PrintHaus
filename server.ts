@@ -5,11 +5,17 @@ import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { PDFDocument } from 'pdf-lib';
 import {
+  AuthenticatedRequest,
+  issueSessionToken,
+  requireAuth,
+  requireRole,
+} from './server/auth';
+import { verifyFirebaseBearerToken } from './server/firebaseAdmin';
+import {
   generateOrderCodes,
   getDb,
   getStatusLabel,
   getUploadsDir,
-  hashPassword,
   hashPasswordScrypt,
   initDatabase,
   saveDatabase,
@@ -17,6 +23,8 @@ import {
 } from './server/store';
 import {
   BindingOption,
+  CollectionHistoryEntry,
+  CollectionRecord,
   ColorMode,
   OrderDocumentItemInput,
   OrderStatus,
@@ -24,8 +32,13 @@ import {
   PrintOrder,
   SidedMode,
   UserAccount,
+  UserRole,
   calculateMultiDocumentOrderPricing,
+  getPrimaryRole,
   getSchoolForProgramme,
+  getUserRoles,
+  normalizeRoles,
+  userHasRole,
 } from './src/types/printhaus';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -36,9 +49,185 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '30mb' }));
 
-  const sanitizeUser = (u: UserAccount) => {
+  // Optional CORS support for cross-origin Vercel -> Render deployment
+  app.use((req, res, next) => {
+    const allowedOriginRaw = process.env.CORS_ORIGIN || process.env.FRONTEND_URL || '';
+    const allowedOrigins = allowedOriginRaw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const requestOrigin = req.headers.origin;
+    if (requestOrigin && allowedOrigins.includes(requestOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    }
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  const confirmingOrderIds = new Set<string>();
+
+  const sanitizeUser = (u: UserAccount): Omit<UserAccount, 'passwordHash'> => {
     const { passwordHash: _ignored, ...safe } = u;
-    return safe;
+    const roles = getUserRoles(u);
+    return {
+      ...safe,
+      roles,
+      role: getPrimaryRole(roles),
+    };
+  };
+
+  const normalizeScanCode = (rawInput: string): string => {
+    const trimmed = String(rawInput ?? '').trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed) as {
+          qrReference?: string;
+          orderCode?: string;
+          collectionCode?: string;
+        };
+        const candidate = parsed.qrReference || parsed.orderCode || parsed.collectionCode || '';
+        return String(candidate).trim().toUpperCase();
+      } catch {
+        // Treat as raw string
+      }
+    }
+    return trimmed.toUpperCase();
+  };
+
+  const findOrderByIdentifier = (orders: PrintOrder[], rawIdentifier: string): PrintOrder | undefined => {
+    const q = normalizeScanCode(rawIdentifier);
+    if (!q) return undefined;
+    return orders.find(
+      (o) =>
+        o.qrReference.toUpperCase() === q ||
+        o.orderCode.toUpperCase() === q ||
+        o.collectionCode.toUpperCase() === q ||
+        o.id.toUpperCase() === q
+    );
+  };
+
+  const confirmOrderCollection = (options: {
+    identifier?: string;
+    orderId?: string;
+    staffUser: UserAccount;
+    method: 'qr_scan' | 'manual_lookup';
+  }):
+    | { ok: true; order: PrintOrder; collectionEntry: CollectionHistoryEntry }
+    | { ok: false; status: number; error: string; order?: PrintOrder } => {
+    const db = getDb();
+    const order = options.orderId
+      ? db.orders.find((o) => o.id === options.orderId)
+      : options.identifier
+        ? findOrderByIdentifier(db.orders, options.identifier)
+        : undefined;
+
+    if (!order) {
+      return {
+        ok: false,
+        status: 404,
+        error: options.identifier
+          ? `No order matches "${String(options.identifier).trim()}".`
+          : 'Order not found.',
+      };
+    }
+
+    if (confirmingOrderIds.has(order.id)) {
+      return {
+        ok: false,
+        status: 409,
+        error: `Collection confirmation for ${order.orderCode} is already in progress.`,
+        order,
+      };
+    }
+
+    confirmingOrderIds.add(order.id);
+    try {
+      if (order.status === 'collected') {
+        const prev = order.collectionRecord;
+        const when = prev?.collectedAt
+          ? new Date(prev.collectedAt).toLocaleString()
+          : new Date(order.updatedAt).toLocaleString();
+        const who = prev?.staffName ? ` by ${prev.staffName}` : '';
+        return {
+          ok: false,
+          status: 409,
+          error: `Order ${order.orderCode} has already been collected on ${when}${who}.`,
+          order,
+        };
+      }
+
+      if (order.status !== 'ready_for_collection') {
+        return {
+          ok: false,
+          status: 400,
+          error: `Order ${order.orderCode} is currently "${getStatusLabel(order.status)}" and is not ready for collection.`,
+          order,
+        };
+      }
+
+      const nowIso = new Date().toISOString();
+      const record: CollectionRecord = {
+        orderId: order.id,
+        orderCode: order.orderCode,
+        collectionCode: order.collectionCode,
+        qrReference: order.qrReference,
+        studentId: order.studentId,
+        studentName: order.studentName,
+        matricNumber: order.matricNumber,
+        staffId: options.staffUser.id,
+        staffName: options.staffUser.name,
+        staffEmail: options.staffUser.email,
+        collectedAt: nowIso,
+        amount: order.pricingBreakdown.totalAmount,
+        paymentStatus: order.paymentStatus,
+        method: options.method,
+      };
+
+      const entry: CollectionHistoryEntry = {
+        id: `col_${crypto.randomUUID().slice(0, 8)}`,
+        ...record,
+        fileName: order.fileName,
+        pickupVenue: order.pickupVenue,
+        status: 'collected',
+      };
+
+      order.status = 'collected';
+      order.updatedAt = nowIso;
+      order.collectionRecord = record;
+      order.statusHistory.push({
+        status: 'collected',
+        label: 'Collected',
+        note: `Verified via ${options.method === 'qr_scan' ? 'QR scan' : 'manual lookup'} (${order.collectionCode}) at ${order.pickupVenue}.`,
+        actor: options.staffUser.name,
+        timestamp: nowIso,
+      });
+
+      const partner = db.partners.find((p) => p.id === order.assignedPartnerId);
+      if (partner) partner.ordersCompleted += 1;
+
+      db.collections.unshift(entry);
+      db.notifications.unshift({
+        id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
+        userId: order.studentId,
+        orderCode: order.orderCode,
+        title: `Order ${order.orderCode} collected`,
+        message: `Handed over to ${order.studentName} by ${options.staffUser.name}. Receipt is saved in your order history.`,
+        read: false,
+        createdAt: nowIso,
+      });
+
+      saveDatabase();
+      return { ok: true, order, collectionEntry: entry };
+    } finally {
+      confirmingOrderIds.delete(order.id);
+    }
   };
 
   // --- AUTH ENDPOINTS ---
@@ -59,8 +248,15 @@ async function startServer() {
       return;
     }
 
-    const db = getDb();
     const normalizedEmail = String(email).trim().toLowerCase();
+    if (!normalizedEmail.endsWith('@pau.edu.ng')) {
+      res.status(400).json({
+        error: 'Public registration is restricted to PAU student email addresses (@pau.edu.ng).',
+      });
+      return;
+    }
+
+    const db = getDb();
     if (db.users.some((u) => u.email.toLowerCase() === normalizedEmail)) {
       res.status(409).json({ error: 'An account with this email already exists.' });
       return;
@@ -75,6 +271,7 @@ async function startServer() {
       return;
     }
 
+    // Ignore any role/roles in body — public signup is strictly student-only
     const newUser: UserAccount = {
       id: `usr_${crypto.randomUUID().slice(0, 8)}`,
       name: String(name).trim(),
@@ -87,20 +284,48 @@ async function startServer() {
       hostelGender: isCampus ? (hostelGender === 'female' ? 'female' : 'male') : undefined,
       hostelName: isCampus && hostelName ? String(hostelName).trim() : undefined,
       role: 'student',
+      roles: ['student'],
       status: 'active',
       createdAt: new Date().toISOString(),
     };
 
     db.users.push(newUser);
     saveDatabase();
-    res.status(201).json({ user: sanitizeUser(newUser) });
+    res.status(201).json({
+      user: sanitizeUser(newUser),
+      token: issueSessionToken(newUser.id),
+    });
   });
 
-  app.post('/api/auth/firebase-sync', (req: Request, res: Response) => {
+  app.post('/api/auth/firebase-sync', async (req: Request, res: Response) => {
+    const authHeader = req.headers.authorization;
+    const bearer =
+      typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+    if (!bearer) {
+      res.status(401).json({ error: 'Verified Firebase ID token is required.' });
+      return;
+    }
+
+    let decoded;
+    try {
+      decoded = await verifyFirebaseBearerToken(bearer);
+    } catch {
+      res.status(401).json({ error: 'Invalid or expired Firebase ID token.' });
+      return;
+    }
+
+    const cleanUid = decoded.uid;
+    const normalizedEmail = String(decoded.email || '').trim().toLowerCase();
+    if (!cleanUid || !normalizedEmail) {
+      res.status(400).json({ error: 'Verified Firebase account must include UID and email.' });
+      return;
+    }
+
     const {
-      uid,
+      checkOnly,
       name,
-      email,
       matricNumber,
       school,
       department,
@@ -109,42 +334,76 @@ async function startServer() {
       hostelName,
     } = req.body ?? {};
 
-    if (!uid || !email) {
-      res.status(400).json({ error: 'Firebase UID and email are required.' });
-      return;
-    }
-
     const db = getDb();
-    const cleanUid = String(uid).trim();
-    const normalizedEmail = String(email).trim().toLowerCase();
     const prog = department ? String(department).trim() : 'Computer Science';
     const isCampus = residency === 'on-campus';
 
-    let existing = db.users.find(
+    const existing = db.users.find(
       (u) => u.id === cleanUid || u.email.toLowerCase() === normalizedEmail
     );
 
+    if (checkOnly && !existing) {
+      res.json({ exists: false, user: null });
+      return;
+    }
+
     if (existing) {
+      if (existing.status === 'suspended') {
+        res.status(403).json({
+          error: 'This account has been deactivated or suspended. Contact PrintHaus Admin.',
+        });
+        return;
+      }
+
+      if (existing.id !== cleanUid) {
+        const previousId = existing.id;
+        existing.id = cleanUid;
+        for (const order of db.orders) {
+          if (order.studentId === previousId) order.studentId = cleanUid;
+        }
+        for (const ntf of db.notifications) {
+          if (ntf.userId === previousId) ntf.userId = cleanUid;
+        }
+        for (const cmp of db.complaints) {
+          if (cmp.studentId === previousId) cmp.studentId = cleanUid;
+        }
+        for (const col of db.collections) {
+          if (col.studentId === previousId) col.studentId = cleanUid;
+          if (col.staffId === previousId) col.staffId = cleanUid;
+        }
+      }
+
+      // Preserve server-authoritative roles — never read roles from client payload
+      existing.roles = getUserRoles(existing);
+      existing.role = getPrimaryRole(existing.roles);
+
       if (name) existing.name = String(name).trim();
       if (matricNumber) existing.matricNumber = String(matricNumber).trim();
-      existing.department = prog;
-      existing.school = school ? String(school).trim() : getSchoolForProgramme(prog);
-      existing.residency = isCampus ? 'on-campus' : 'off-campus';
-      existing.hostelGender = isCampus
-        ? hostelGender === 'female'
-          ? 'female'
-          : 'male'
-        : undefined;
-      existing.hostelName =
-        isCampus && hostelName ? String(hostelName).trim() : undefined;
+      if (department) {
+        existing.department = prog;
+        existing.school = school ? String(school).trim() : getSchoolForProgramme(prog) || existing.school;
+      }
+      if (residency === 'on-campus' || residency === 'off-campus') {
+        existing.residency = isCampus ? 'on-campus' : 'off-campus';
+        existing.hostelGender = isCampus
+          ? hostelGender === 'female'
+            ? 'female'
+            : 'male'
+          : undefined;
+        existing.hostelName =
+          isCampus && hostelName ? String(hostelName).trim() : undefined;
+      }
+
       saveDatabase();
       res.json({ user: sanitizeUser(existing) });
       return;
     }
 
+    const isBootstrappedAdmin = normalizedEmail === 'chukwuemekaodoemene@gmail.com';
+    const roles: UserRole[] = isBootstrappedAdmin ? ['admin', 'student'] : ['student'];
     const createdUser: UserAccount = {
       id: cleanUid,
-      name: String(name || 'PAU Student').trim(),
+      name: String(name || decoded.name || 'PAU Student').trim(),
       email: normalizedEmail,
       matricNumber: matricNumber ? String(matricNumber).trim() : 'PAU-NEW',
       school: school ? String(school).trim() : getSchoolForProgramme(prog),
@@ -152,7 +411,8 @@ async function startServer() {
       residency: isCampus ? 'on-campus' : 'off-campus',
       hostelGender: isCampus ? (hostelGender === 'female' ? 'female' : 'male') : undefined,
       hostelName: isCampus && hostelName ? String(hostelName).trim() : undefined,
-      role: 'student',
+      role: getPrimaryRole(roles),
+      roles,
       status: 'active',
       createdAt: new Date().toISOString(),
     };
@@ -162,7 +422,17 @@ async function startServer() {
     res.status(201).json({ user: sanitizeUser(createdUser) });
   });
 
-  app.patch('/api/users/:id/profile', (req: Request, res: Response) => {
+  app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    res.json({ user: sanitizeUser(req.authUser!) });
+  });
+
+  app.patch('/api/users/:id/profile', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const authUser = req.authUser!;
+    if (authUser.id !== req.params.id && !userHasRole(authUser, 'admin')) {
+      res.status(403).json({ error: 'Forbidden: you can only update your own profile.' });
+      return;
+    }
+
     const db = getDb();
     const user = db.users.find((u) => u.id === req.params.id);
     if (!user) {
@@ -204,11 +474,16 @@ async function startServer() {
     }
 
     if (user.status === 'suspended') {
-      res.status(403).json({ error: 'This account has been suspended. Contact PrintHaus Admin.' });
+      res.status(403).json({
+        error: 'This account has been deactivated or suspended. Contact PrintHaus Admin.',
+      });
       return;
     }
 
-    res.json({ user: sanitizeUser(user) });
+    res.json({
+      user: sanitizeUser(user),
+      token: issueSessionToken(user.id),
+    });
   });
 
   // --- FORGOT PASSWORD / EMAIL CODE RECOVERY ---
@@ -322,7 +597,7 @@ async function startServer() {
       return;
     }
 
-    if (user.role !== 'student') {
+    if (userHasRole(user, 'staff') || userHasRole(user, 'admin')) {
       res.status(503).json({
         error: 'Email delivery requires RESEND_API_KEY for staff and admin password recovery.',
       });
@@ -428,7 +703,10 @@ async function startServer() {
     }
 
     resetChallenges.delete(rawEmail);
-    res.json({ user: sanitizeUser(user) });
+    res.json({
+      user: sanitizeUser(user),
+      token: issueSessionToken(user.id),
+    });
   });
 
   app.get('/api/auth/demo-accounts', (_req: Request, res: Response) => {
@@ -446,7 +724,7 @@ async function startServer() {
     res.json({ pricing: db.pricing });
   });
 
-  app.put('/api/pricing', (req: Request, res: Response) => {
+  app.put('/api/pricing', requireAuth, requireRole('admin'), (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
     const body = req.body ?? {};
     const numericFields = [
@@ -481,9 +759,9 @@ async function startServer() {
   });
 
   // --- DOCUMENT UPLOAD & DOWNLOAD ---
-  app.post('/api/documents/upload', async (req: Request, res: Response) => {
+  app.post('/api/documents/upload', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { fileName, mimeType, base64Data, uploadedBy, fallbackPageCount } = req.body ?? {};
+      const { fileName, mimeType, base64Data, fallbackPageCount } = req.body ?? {};
       if (!fileName || !base64Data) {
         res.status(400).json({ error: 'File name and file payload are required.' });
         return;
@@ -509,7 +787,6 @@ async function startServer() {
           const detected = pdfDoc.getPageCount();
           if (detected > 0) pageCount = detected;
         } catch {
-          // Regex fallback for non-standard PDFs
           const text = buffer.toString('latin1');
           const matches = text.match(/\/Type\s*\/Page[^s]/g);
           if (matches && matches.length > 0) pageCount = matches.length;
@@ -518,7 +795,6 @@ async function startServer() {
         const lines = buffer.toString('utf-8').split('\n').length;
         pageCount = Math.max(1, Math.ceil(lines / 42));
       } else if (lowerName.endsWith('.doc') || lowerName.endsWith('.docx')) {
-        // Estimate reasonable page count from Word XML/binary size if user didn't specify
         if (!fallbackPageCount) {
           pageCount = Math.max(1, Math.min(80, Math.round(buffer.length / 18000)));
         }
@@ -532,7 +808,7 @@ async function startServer() {
         size: buffer.length,
         pageCount,
         storagePath,
-        uploadedBy: String(uploadedBy || 'guest'),
+        uploadedBy: req.authUser!.id,
         createdAt: new Date().toISOString(),
       };
       db.documents.push(record);
@@ -553,11 +829,25 @@ async function startServer() {
     }
   });
 
-  app.get('/api/documents/:id/file', (req: Request, res: Response) => {
+  app.get('/api/documents/:id/file', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
     const doc = db.documents.find((d) => d.id === req.params.id);
     if (!doc || !fs.existsSync(doc.storagePath)) {
       res.status(404).json({ error: 'Document file not found.' });
+      return;
+    }
+
+    const authUser = req.authUser!;
+    const isPrivileged = userHasRole(authUser, 'staff') || userHasRole(authUser, 'admin');
+    const isUploader = doc.uploadedBy === authUser.id;
+    const ownsLinkedOrder = db.orders.some(
+      (o) =>
+        o.studentId === authUser.id &&
+        (o.documentId === doc.id || (o.items ?? []).some((item) => item.documentId === doc.id))
+    );
+
+    if (!isPrivileged && !isUploader && !ownsLinkedOrder) {
+      res.status(403).json({ error: 'Forbidden: you do not have access to this document.' });
       return;
     }
 
@@ -571,15 +861,22 @@ async function startServer() {
   });
 
   // --- ORDERS ---
-  app.get('/api/orders', (req: Request, res: Response) => {
+  app.get('/api/orders', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
-    const { studentId, status } = req.query;
+    const authUser = req.authUser!;
+    const { studentId, status, scope } = req.query;
+    const isPrivileged = userHasRole(authUser, 'staff') || userHasRole(authUser, 'admin');
+
     let list = [...db.orders].sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
     );
-    if (studentId) {
+
+    if (scope === 'student' || !isPrivileged) {
+      list = list.filter((o) => o.studentId === authUser.id);
+    } else if (studentId) {
       list = list.filter((o) => o.studentId === String(studentId));
     }
+
     if (status && status !== 'all') {
       list = list.filter((o) => o.status === String(status));
     }
@@ -588,24 +885,36 @@ async function startServer() {
 
   app.get('/api/orders/track/:code', (req: Request, res: Response) => {
     const db = getDb();
-    const q = String(req.params.code).trim().toUpperCase();
-    const order = db.orders.find(
-      (o) => o.orderCode.toUpperCase() === q || o.collectionCode.toUpperCase() === q
-    );
+    const order = findOrderByIdentifier(db.orders, req.params.code);
     if (!order) {
-      res.status(404).json({ error: `No order found matching "${q}".` });
+      res.status(404).json({ error: `No order found matching "${String(req.params.code).trim()}".` });
       return;
     }
-    res.json({ order });
+
+    // Public tracker intentionally omits student PII, document IDs, and private QR token
+    res.json({
+      order: {
+        id: order.id,
+        orderCode: order.orderCode,
+        fileName: order.fileName,
+        pageCount: order.pageCount,
+        specs: { copies: order.specs.copies },
+        pricingBreakdown: { totalAmount: order.pricingBreakdown.totalAmount },
+        status: order.status,
+        statusHistory: order.statusHistory,
+        pickupVenue: order.pickupVenue,
+        pickupShelf: order.pickupShelf,
+        rejectionReason: order.rejectionReason,
+        createdAt: order.createdAt,
+        updatedAt: order.updatedAt,
+      },
+    });
   });
 
-  app.post('/api/orders', (req: Request, res: Response) => {
+  app.post('/api/orders', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
+    const authUser = req.authUser!;
     const {
-      studentId,
-      studentName,
-      studentEmail,
-      matricNumber,
       documentId,
       fileName,
       fileSize,
@@ -659,12 +968,12 @@ async function startServer() {
       ];
     }
 
-    if (!studentId || rawItems.length === 0) {
-      res.status(400).json({ error: 'Student account and at least one uploaded document are required.' });
+    if (rawItems.length === 0) {
+      res.status(400).json({ error: 'At least one uploaded document is required.' });
       return;
     }
 
-    const existingStudentOrders = db.orders.filter((o) => o.studentId === studentId);
+    const existingStudentOrders = db.orders.filter((o) => o.studentId === authUser.id);
     const isFirstOrder = existingStudentOrders.length === 0;
     const { breakdown: pricingBreakdown, computedItems } = calculateMultiDocumentOrderPricing(
       rawItems,
@@ -692,7 +1001,7 @@ async function startServer() {
         .slice(0, 300),
     };
 
-    const { orderCode, collectionCode } = generateOrderCodes(db.orders);
+    const { orderCode, collectionCode, qrReference } = generateOrderCodes(db.orders);
     const primaryPartner =
       db.partners.find((p) => p.type === 'primary' && p.status === 'available') ||
       db.partners.find((p) => p.status !== 'offline') ||
@@ -715,7 +1024,7 @@ async function startServer() {
           computedItems.length > 1
             ? `Uploaded ${computedItems.length} documents (${totalCopies} total copies, ${pricingBreakdown.totalPages} pages).`
             : `Uploaded ${primaryItem.fileName} (${primaryItem.pageCount} pages, ${primaryItem.specs.copies}x).`,
-        actor: String(studentName || 'Student'),
+        actor: authUser.name,
         timestamp: nowIso,
       },
     ];
@@ -737,10 +1046,11 @@ async function startServer() {
       id: `ord_${crypto.randomUUID().slice(0, 8)}`,
       orderCode,
       collectionCode,
-      studentId: String(studentId),
-      studentName: String(studentName || 'PAU Student'),
-      studentEmail: String(studentEmail || ''),
-      matricNumber: String(matricNumber || 'PAU-STD'),
+      qrReference,
+      studentId: authUser.id,
+      studentName: authUser.name,
+      studentEmail: authUser.email,
+      matricNumber: authUser.matricNumber || 'PAU-STD',
       documentId: primaryItem.documentId,
       fileName: summaryFileName,
       fileSize: computedItems.reduce((sum, item) => sum + item.fileSize, 0),
@@ -770,6 +1080,7 @@ async function startServer() {
       pickupSlot: String(pickupSlot || 'Anytime during operating hours'),
       pickupShelf: null,
       rejectionReason: null,
+      collectionRecord: null,
       createdAt: nowIso,
       updatedAt: nowIso,
     };
@@ -791,316 +1102,682 @@ async function startServer() {
     res.status(201).json({ order: newOrder });
   });
 
-  app.patch('/api/orders/:id/payment', (req: Request, res: Response) => {
-    const db = getDb();
-    const order = db.orders.find((o) => o.id === req.params.id);
-    if (!order) {
-      res.status(404).json({ error: 'Order not found.' });
-      return;
-    }
-
-    const { actor = 'Printing Staff' } = req.body ?? {};
-    const nowIso = new Date().toISOString();
-    order.paymentStatus = 'confirmed';
-    if (order.status === 'order_received') {
-      order.status = 'payment_confirmed';
-      order.statusHistory.push({
-        status: 'payment_confirmed',
-        label: 'Payment confirmed',
-        note: `Transfer reference ${order.paymentReference} verified.`,
-        actor: String(actor),
-        timestamp: nowIso,
-      });
-    }
-    order.updatedAt = nowIso;
-
-    db.notifications.unshift({
-      id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
-      userId: order.studentId,
-      orderCode: order.orderCode,
-      title: `Payment confirmed for ${order.orderCode}`,
-      message: `Your payment (${order.paymentReference}) has been verified and queued for printing.`,
-      read: false,
-      createdAt: nowIso,
-    });
-
-    saveDatabase();
-    res.json({ order });
-  });
-
-  app.patch('/api/orders/:id/status', (req: Request, res: Response) => {
-    const db = getDb();
-    const order = db.orders.find((o) => o.id === req.params.id);
-    if (!order) {
-      res.status(404).json({ error: 'Order not found.' });
-      return;
-    }
-
-    const { status, note, actor = 'Printing Staff', qualityChecklist, pickupShelf, assignedPartnerId, rejectionReason } =
-      req.body ?? {};
-    const nowIso = new Date().toISOString();
-
-    if (qualityChecklist) {
-      order.qualityChecklist = { ...order.qualityChecklist, ...qualityChecklist };
-    }
-
-    if (assignedPartnerId) {
-      const partner = db.partners.find((p) => p.id === assignedPartnerId);
-      if (partner) {
-        order.assignedPartnerId = partner.id;
-        order.assignedPartnerName = partner.name;
-      }
-    }
-
-    if (status) {
-      const nextStatus = status as OrderStatus;
-      order.status = nextStatus;
-
-      if (nextStatus === 'ready_for_collection') {
-        order.pickupShelf =
-          pickupShelf ||
-          order.pickupShelf ||
-          `Cubby ${String.fromCharCode(65 + (db.orders.length % 3))}-${String(
-            (db.orders.length % 15) + 1
-          ).padStart(2, '0')}`;
+  app.patch(
+    '/api/orders/:id/payment',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const order = db.orders.find((o) => o.id === req.params.id);
+      if (!order) {
+        res.status(404).json({ error: 'Order not found.' });
+        return;
       }
 
-      if (nextStatus === 'rejected') {
-        order.rejectionReason = String(rejectionReason || 'File formatting issue detected.');
-      }
-
-      if (nextStatus === 'collected') {
-        const partner = db.partners.find((p) => p.id === order.assignedPartnerId);
-        if (partner) partner.ordersCompleted += 1;
-      }
-
-      order.statusHistory.push({
-        status: nextStatus,
-        label: getStatusLabel(nextStatus),
-        note:
-          String(note || '').trim() ||
-          (nextStatus === 'ready_for_collection'
-            ? `Packaged and placed at ${order.pickupVenue} (${order.pickupShelf}).`
-            : `Updated to ${getStatusLabel(nextStatus)}.`),
-        actor: String(actor),
-        timestamp: nowIso,
-      });
-
-      const titleMap: Partial<Record<OrderStatus, string>> = {
-        printing_in_progress: `Printing started for ${order.orderCode}`,
-        quality_check: `Quality inspection underway for ${order.orderCode}`,
-        ready_for_collection: `${order.orderCode} is ready at ${order.pickupVenue}`,
-        collected: `Order ${order.orderCode} collected`,
-        rejected: `Action needed on order ${order.orderCode}`,
-      };
-
-      if (titleMap[nextStatus]) {
-        db.notifications.unshift({
-          id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
-          userId: order.studentId,
-          orderCode: order.orderCode,
-          title: titleMap[nextStatus]!,
-          message:
-            nextStatus === 'ready_for_collection'
-              ? `Collect anytime during operating hours at ${order.pickupVenue} (${order.pickupShelf}) with code ${order.collectionCode}.`
-              : String(note || `Order status is now ${getStatusLabel(nextStatus)}.`),
-          read: false,
-          createdAt: nowIso,
+      const actorName = req.authUser!.name;
+      const nowIso = new Date().toISOString();
+      order.paymentStatus = 'confirmed';
+      if (order.status === 'order_received') {
+        order.status = 'payment_confirmed';
+        order.statusHistory.push({
+          status: 'payment_confirmed',
+          label: 'Payment confirmed',
+          note: `Transfer reference ${order.paymentReference} verified.`,
+          actor: actorName,
+          timestamp: nowIso,
         });
       }
+      order.updatedAt = nowIso;
+
+      db.notifications.unshift({
+        id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
+        userId: order.studentId,
+        orderCode: order.orderCode,
+        title: `Payment confirmed for ${order.orderCode}`,
+        message: `Your payment (${order.paymentReference}) has been verified and queued for printing.`,
+        read: false,
+        createdAt: nowIso,
+      });
+
+      saveDatabase();
+      res.json({ order });
     }
+  );
 
-    order.updatedAt = nowIso;
-    saveDatabase();
-    res.json({ order });
-  });
+  app.patch(
+    '/api/orders/:id/status',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const order = db.orders.find((o) => o.id === req.params.id);
+      if (!order) {
+        res.status(404).json({ error: 'Order not found.' });
+        return;
+      }
 
-  app.post('/api/orders/verify-collection', (req: Request, res: Response) => {
-    const db = getDb();
-    const { code, actor = 'Pickup Attendant' } = req.body ?? {};
-    const q = String(code ?? '').trim().toUpperCase();
-    const order = db.orders.find(
-      (o) => o.collectionCode.toUpperCase() === q || o.orderCode.toUpperCase() === q
-    );
-    if (!order) {
-      res.status(404).json({ error: `No order matches code "${q}".` });
-      return;
+      const { status, note, qualityChecklist, pickupShelf, assignedPartnerId, rejectionReason } =
+        req.body ?? {};
+      const actorName = req.authUser!.name;
+
+      if (status === 'collected') {
+        const result = confirmOrderCollection({
+          orderId: order.id,
+          staffUser: req.authUser!,
+          method: 'manual_lookup',
+        });
+        if (!result.ok) {
+          res.status(result.status).json({ error: result.error, order: result.order });
+          return;
+        }
+        res.json({ order: result.order });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+
+      if (qualityChecklist) {
+        order.qualityChecklist = { ...order.qualityChecklist, ...qualityChecklist };
+      }
+
+      if (assignedPartnerId) {
+        const partner = db.partners.find((p) => p.id === assignedPartnerId);
+        if (partner) {
+          order.assignedPartnerId = partner.id;
+          order.assignedPartnerName = partner.name;
+        }
+      }
+
+      if (status) {
+        const nextStatus = status as OrderStatus;
+        order.status = nextStatus;
+
+        if (nextStatus === 'ready_for_collection') {
+          order.pickupShelf =
+            pickupShelf ||
+            order.pickupShelf ||
+            `Cubby ${String.fromCharCode(65 + (db.orders.length % 3))}-${String(
+              (db.orders.length % 15) + 1
+            ).padStart(2, '0')}`;
+        }
+
+        if (nextStatus === 'rejected') {
+          order.rejectionReason = String(rejectionReason || 'File formatting issue detected.');
+        }
+
+        order.statusHistory.push({
+          status: nextStatus,
+          label: getStatusLabel(nextStatus),
+          note:
+            String(note || '').trim() ||
+            (nextStatus === 'ready_for_collection'
+              ? `Packaged and placed at ${order.pickupVenue} (${order.pickupShelf}).`
+              : `Updated to ${getStatusLabel(nextStatus)}.`),
+          actor: actorName,
+          timestamp: nowIso,
+        });
+
+        const titleMap: Partial<Record<OrderStatus, string>> = {
+          printing_in_progress: `Printing started for ${order.orderCode}`,
+          quality_check: `Quality inspection underway for ${order.orderCode}`,
+          ready_for_collection: `${order.orderCode} is ready at ${order.pickupVenue}`,
+          rejected: `Action needed on order ${order.orderCode}`,
+        };
+
+        if (titleMap[nextStatus]) {
+          db.notifications.unshift({
+            id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
+            userId: order.studentId,
+            orderCode: order.orderCode,
+            title: titleMap[nextStatus]!,
+            message:
+              nextStatus === 'ready_for_collection'
+                ? `Collect anytime during operating hours at ${order.pickupVenue} (${order.pickupShelf}) with code ${order.collectionCode} or QR slip.`
+                : String(note || `Order status is now ${getStatusLabel(nextStatus)}.`),
+            read: false,
+            createdAt: nowIso,
+          });
+        }
+      }
+
+      order.updatedAt = nowIso;
+      saveDatabase();
+      res.json({ order });
     }
-    if (order.status === 'collected') {
-      res.status(409).json({ error: `Order ${order.orderCode} was already collected.`, order });
-      return;
+  );
+
+  // --- STAFF COLLECTION, OVERVIEW, SUPPLIES & PARTNERS ---
+  app.get(
+    '/api/staff/overview',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (_req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const sortedCollections = [...db.collections].sort(
+        (a, b) => new Date(b.collectedAt).getTime() - new Date(a.collectedAt).getTime()
+      );
+      res.json({
+        metrics: {
+          totalOrders: db.orders.length,
+          pendingOrders: db.orders.filter((o) =>
+            ['order_received', 'payment_confirmed'].includes(o.status)
+          ).length,
+          processingOrders: db.orders.filter((o) =>
+            ['printing_in_progress', 'quality_check'].includes(o.status)
+          ).length,
+          readyForCollection: db.orders.filter((o) => o.status === 'ready_for_collection').length,
+          collectedOrders: db.orders.filter((o) => o.status === 'collected').length,
+          recentCollections: sortedCollections.slice(0, 8),
+        },
+      });
     }
+  );
 
-    const nowIso = new Date().toISOString();
-    order.status = 'collected';
-    order.updatedAt = nowIso;
-    order.statusHistory.push({
-      status: 'collected',
-      label: 'Collected',
-      note: `Collection code ${order.collectionCode} verified at PAU Pickup Counter.`,
-      actor: String(actor),
-      timestamp: nowIso,
-    });
+  app.post(
+    '/api/staff/collection/lookup',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const rawCode = String(req.body?.code ?? '').trim();
+      if (!rawCode) {
+        res.status(400).json({ error: 'Enter or scan a QR reference, order number, or collection code.' });
+        return;
+      }
 
-    db.notifications.unshift({
-      id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
-      userId: order.studentId,
-      orderCode: order.orderCode,
-      title: `Order ${order.orderCode} collected`,
-      message: `Thank you for using PrintHaus! Receipt is available in your order history.`,
-      read: false,
-      createdAt: nowIso,
-    });
+      const order = findOrderByIdentifier(db.orders, rawCode);
+      if (!order) {
+        res.status(404).json({ error: `No order found matching "${rawCode}".` });
+        return;
+      }
 
-    saveDatabase();
-    res.json({ order });
-  });
+      const alreadyCollected = order.status === 'collected';
+      const canConfirm = order.status === 'ready_for_collection';
+      let blockReason: string | null = null;
+      if (alreadyCollected) {
+        const who = order.collectionRecord?.staffName
+          ? ` by ${order.collectionRecord.staffName}`
+          : '';
+        const when = order.collectionRecord?.collectedAt
+          ? ` on ${new Date(order.collectionRecord.collectedAt).toLocaleString()}`
+          : '';
+        blockReason = `This order has already been collected${when}${who}.`;
+      } else if (!canConfirm) {
+        blockReason = `Order is currently "${getStatusLabel(order.status)}". Mark it Ready for Pickup before confirming collection.`;
+      }
 
-  // --- STAFF SUPPLIES ---
-  app.get('/api/staff/supplies', (_req: Request, res: Response) => {
-    const db = getDb();
-    res.json({ supplies: db.supplies });
-  });
-
-  app.patch('/api/staff/supplies/:id', (req: Request, res: Response) => {
-    const db = getDb();
-    const item = db.supplies.find((s) => s.id === req.params.id);
-    if (!item) {
-      res.status(404).json({ error: 'Supply item not found.' });
-      return;
+      res.json({
+        order,
+        canConfirm,
+        alreadyCollected,
+        blockReason,
+      });
     }
-    const { quantity, delta } = req.body ?? {};
-    if (typeof quantity === 'number') {
-      item.quantity = Math.max(0, Math.round(quantity));
-    } else if (typeof delta === 'number') {
-      item.quantity = Math.max(0, item.quantity + Math.round(delta));
+  );
+
+  app.post(
+    '/api/staff/collection/confirm',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const { code, orderId, method } = req.body ?? {};
+      const confirmMethod = method === 'manual_lookup' ? 'manual_lookup' : 'qr_scan';
+      const result = confirmOrderCollection({
+        identifier: code ? String(code) : undefined,
+        orderId: orderId ? String(orderId) : undefined,
+        staffUser: req.authUser!,
+        method: confirmMethod,
+      });
+
+      if (!result.ok) {
+        res.status(result.status).json({ error: result.error, order: result.order });
+        return;
+      }
+
+      res.json({
+        order: result.order,
+        collectionEntry: result.collectionEntry,
+      });
     }
-    item.updatedAt = new Date().toISOString();
-    saveDatabase();
-    res.json({ supply: item });
-  });
+  );
 
-  // --- ADMIN: OVERVIEW, USERS, PARTNERS, COMPLAINTS ---
-  app.get('/api/admin/overview', (_req: Request, res: Response) => {
-    const db = getDb();
-    const activeOrders = db.orders.filter((o) => o.status !== 'rejected' && o.paymentStatus !== 'refunded');
-    const grossRevenue = activeOrders.reduce((s, o) => s + o.pricingBreakdown.totalAmount, 0);
-    const partnerPayouts = activeOrders.reduce((s, o) => s + o.pricingBreakdown.partnerCost, 0);
-    const packagingAndOperating = activeOrders.reduce(
-      (s, o) => s + o.pricingBreakdown.packagingCost + o.pricingBreakdown.operatingCost,
-      0
-    );
-    const netContribution = grossRevenue - partnerPayouts - packagingAndOperating;
-    const totalPagesPrinted = activeOrders.reduce((s, o) => s + o.pricingBreakdown.totalPages, 0);
-
-    const ordersByStudent = new Map<string, number>();
-    for (const o of activeOrders) {
-      ordersByStudent.set(o.studentId, (ordersByStudent.get(o.studentId) ?? 0) + 1);
+  app.post(
+    '/api/orders/verify-collection',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const { code, method } = req.body ?? {};
+      const result = confirmOrderCollection({
+        identifier: code ? String(code) : undefined,
+        staffUser: req.authUser!,
+        method: method === 'manual_lookup' ? 'manual_lookup' : 'qr_scan',
+      });
+      if (!result.ok) {
+        res.status(result.status).json({ error: result.error, order: result.order });
+        return;
+      }
+      res.json({
+        order: result.order,
+        collectionEntry: result.collectionEntry,
+      });
     }
-    const uniqueStudents = ordersByStudent.size;
-    const repeatCustomers = Array.from(ordersByStudent.values()).filter((c) => c > 1).length;
+  );
 
-    res.json({
-      metrics: {
-        totalOrders: db.orders.length,
-        activeQueueCount: db.orders.filter((o) => !['collected', 'rejected'].includes(o.status)).length,
-        readyForPickupCount: db.orders.filter((o) => o.status === 'ready_for_collection').length,
-        grossRevenue,
-        partnerPayouts,
-        packagingAndOperating,
-        netContribution,
-        totalPagesPrinted,
-        uniqueStudents,
-        repeatCustomers,
-        openComplaints: db.complaints.filter((c) => c.status === 'open').length,
-      },
-    });
-  });
+  app.get(
+    '/api/staff/collections',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const q = String(req.query.q ?? '').trim().toLowerCase();
+      const dateFilter = String(req.query.date ?? '').trim();
+      const staffIdFilter = String(req.query.staffId ?? '').trim();
 
-  app.get('/api/admin/users', (_req: Request, res: Response) => {
-    const db = getDb();
-    res.json({ users: db.users.map(sanitizeUser) });
-  });
+      const allSorted = [...db.collections].sort(
+        (a, b) => new Date(b.collectedAt).getTime() - new Date(a.collectedAt).getTime()
+      );
 
-  app.post('/api/admin/users', (req: Request, res: Response) => {
-    const db = getDb();
-    const { name, email, role, department, matricNumber, residency } = req.body ?? {};
-    if (!name || !email) {
-      res.status(400).json({ error: 'Name and email are required.' });
-      return;
+      const staffMap = new Map<string, { staffId: string; staffName: string; staffEmail: string }>();
+      for (const entry of allSorted) {
+        if (!staffMap.has(entry.staffId)) {
+          staffMap.set(entry.staffId, {
+            staffId: entry.staffId,
+            staffName: entry.staffName,
+            staffEmail: entry.staffEmail,
+          });
+        }
+      }
+
+      const filtered = allSorted.filter((entry) => {
+        if (q) {
+          const matchesQuery =
+            entry.orderCode.toLowerCase().includes(q) ||
+            entry.collectionCode.toLowerCase().includes(q) ||
+            entry.studentName.toLowerCase().includes(q) ||
+            entry.staffName.toLowerCase().includes(q) ||
+            (entry.matricNumber || '').toLowerCase().includes(q);
+          if (!matchesQuery) return false;
+        }
+        if (dateFilter) {
+          const entryDate = entry.collectedAt.slice(0, 10);
+          if (entryDate !== dateFilter) return false;
+        }
+        if (staffIdFilter && staffIdFilter !== 'all' && entry.staffId !== staffIdFilter) {
+          return false;
+        }
+        return true;
+      });
+
+      res.json({
+        collections: filtered,
+        staffOptions: Array.from(staffMap.values()),
+      });
     }
-    const normalizedEmail = String(email).trim().toLowerCase();
-    if (db.users.some((u) => u.email.toLowerCase() === normalizedEmail)) {
-      res.status(409).json({ error: 'Email already exists.' });
-      return;
+  );
+
+  app.get(
+    '/api/staff/supplies',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (_req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      res.json({ supplies: db.supplies });
     }
-    const newUser: UserAccount = {
-      id: `usr_${crypto.randomUUID().slice(0, 8)}`,
-      name: String(name).trim(),
-      email: normalizedEmail,
-      passwordHash: hashPasswordScrypt('printhaus123'),
-      department: String(department || 'Print Operations'),
-      matricNumber: matricNumber ? String(matricNumber).trim() : undefined,
-      residency: residency === 'on-campus' ? 'on-campus' : 'off-campus',
-      role: ['student', 'staff', 'admin'].includes(role) ? role : 'staff',
-      status: 'active',
-      createdAt: new Date().toISOString(),
-    };
-    db.users.push(newUser);
-    saveDatabase();
-    res.status(201).json({ user: sanitizeUser(newUser) });
-  });
+  );
 
-  app.patch('/api/admin/users/:id', (req: Request, res: Response) => {
-    const db = getDb();
-    const user = db.users.find((u) => u.id === req.params.id);
-    if (!user) {
-      res.status(404).json({ error: 'User not found.' });
-      return;
+  app.patch(
+    '/api/staff/supplies/:id',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const item = db.supplies.find((s) => s.id === req.params.id);
+      if (!item) {
+        res.status(404).json({ error: 'Supply item not found.' });
+        return;
+      }
+      const { quantity, delta } = req.body ?? {};
+      if (typeof quantity === 'number') {
+        item.quantity = Math.max(0, Math.round(quantity));
+      } else if (typeof delta === 'number') {
+        item.quantity = Math.max(0, item.quantity + Math.round(delta));
+      }
+      item.updatedAt = new Date().toISOString();
+      saveDatabase();
+      res.json({ supply: item });
     }
-    const { status, role } = req.body ?? {};
-    if (status === 'active' || status === 'suspended') user.status = status;
-    if (role === 'student' || role === 'staff' || role === 'admin') user.role = role;
-    saveDatabase();
-    res.json({ user: sanitizeUser(user) });
-  });
+  );
 
-  app.get('/api/admin/partners', (_req: Request, res: Response) => {
-    const db = getDb();
-    res.json({ partners: db.partners });
-  });
-
-  app.patch('/api/admin/partners/:id', (req: Request, res: Response) => {
-    const db = getDb();
-    const partner = db.partners.find((p) => p.id === req.params.id);
-    if (!partner) {
-      res.status(404).json({ error: 'Partner not found.' });
-      return;
+  app.get(
+    '/api/staff/partners',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (_req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      res.json({ partners: db.partners });
     }
-    const { status, turnaroundMinutes, costPerBwPage, costPerColorPage } = req.body ?? {};
-    if (['available', 'busy', 'offline'].includes(status)) partner.status = status;
-    if (typeof turnaroundMinutes === 'number') partner.turnaroundMinutes = turnaroundMinutes;
-    if (typeof costPerBwPage === 'number') partner.costPerBwPage = costPerBwPage;
-    if (typeof costPerColorPage === 'number') partner.costPerColorPage = costPerColorPage;
-    saveDatabase();
-    res.json({ partner });
-  });
+  );
 
-  app.get('/api/complaints', (req: Request, res: Response) => {
+  // --- ADMIN: OVERVIEW, USERS, STAFF MANAGEMENT, PARTNERS, COMPLAINTS ---
+  app.get(
+    '/api/admin/overview',
+    requireAuth,
+    requireRole('admin'),
+    (_req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const activeOrders = db.orders.filter(
+        (o) => o.status !== 'rejected' && o.paymentStatus !== 'refunded'
+      );
+      const grossRevenue = activeOrders.reduce((s, o) => s + o.pricingBreakdown.totalAmount, 0);
+      const partnerPayouts = activeOrders.reduce((s, o) => s + o.pricingBreakdown.partnerCost, 0);
+      const packagingAndOperating = activeOrders.reduce(
+        (s, o) => s + o.pricingBreakdown.packagingCost + o.pricingBreakdown.operatingCost,
+        0
+      );
+      const netContribution = grossRevenue - partnerPayouts - packagingAndOperating;
+      const totalPagesPrinted = activeOrders.reduce((s, o) => s + o.pricingBreakdown.totalPages, 0);
+
+      const ordersByStudent = new Map<string, number>();
+      for (const o of activeOrders) {
+        ordersByStudent.set(o.studentId, (ordersByStudent.get(o.studentId) ?? 0) + 1);
+      }
+      const uniqueStudents = ordersByStudent.size;
+      const repeatCustomers = Array.from(ordersByStudent.values()).filter((c) => c > 1).length;
+
+      res.json({
+        metrics: {
+          totalOrders: db.orders.length,
+          activeQueueCount: db.orders.filter((o) => !['collected', 'rejected'].includes(o.status))
+            .length,
+          readyForPickupCount: db.orders.filter((o) => o.status === 'ready_for_collection').length,
+          grossRevenue,
+          partnerPayouts,
+          packagingAndOperating,
+          netContribution,
+          totalPagesPrinted,
+          uniqueStudents,
+          repeatCustomers,
+          openComplaints: db.complaints.filter((c) => c.status === 'open').length,
+        },
+      });
+    }
+  );
+
+  app.get(
+    '/api/admin/users',
+    requireAuth,
+    requireRole('admin'),
+    (_req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      res.json({ users: db.users.map(sanitizeUser) });
+    }
+  );
+
+  app.get(
+    '/api/admin/staff',
+    requireAuth,
+    requireRole('admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const q = String(req.query.q ?? '').trim().toLowerCase();
+
+      const activityByStaff = new Map<
+        string,
+        {
+          totalCollections: number;
+          lastCollectedAt: string | null;
+          recentCollections: CollectionHistoryEntry[];
+        }
+      >();
+
+      const sortedCollections = [...db.collections].sort(
+        (a, b) => new Date(b.collectedAt).getTime() - new Date(a.collectedAt).getTime()
+      );
+
+      for (const col of sortedCollections) {
+        const current = activityByStaff.get(col.staffId) || {
+          totalCollections: 0,
+          lastCollectedAt: null,
+          recentCollections: [],
+        };
+        current.totalCollections += 1;
+        if (!current.lastCollectedAt) current.lastCollectedAt = col.collectedAt;
+        if (current.recentCollections.length < 5) current.recentCollections.push(col);
+        activityByStaff.set(col.staffId, current);
+      }
+
+      const staffList = db.users
+        .filter((u) => userHasRole(u, 'staff') || userHasRole(u, 'admin'))
+        .filter((u) => {
+          if (!q) return true;
+          return (
+            u.name.toLowerCase().includes(q) ||
+            u.email.toLowerCase().includes(q) ||
+            (u.department || '').toLowerCase().includes(q)
+          );
+        })
+        .map((u) => {
+          const activity = activityByStaff.get(u.id) || {
+            totalCollections: 0,
+            lastCollectedAt: null,
+            recentCollections: [],
+          };
+          return {
+            ...sanitizeUser(u),
+            collectionStats: activity,
+          };
+        });
+
+      res.json({
+        staff: staffList,
+        recentCollections: sortedCollections.slice(0, 15),
+      });
+    }
+  );
+
+  app.post(
+    '/api/admin/users',
+    requireAuth,
+    requireRole('admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const { name, email, role, roles, department, matricNumber, residency, password } =
+        req.body ?? {};
+      if (!email) {
+        res.status(400).json({ error: 'Email is required.' });
+        return;
+      }
+
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const requestedRoles = normalizeRoles(
+        Array.isArray(roles) ? (roles as UserRole[]) : undefined,
+        role && ['student', 'staff', 'admin'].includes(role) ? (role as UserRole) : 'staff'
+      );
+
+      // If user already exists (e.g., an existing PAU student), update their roles instead of duplicating
+      const existing = db.users.find((u) => u.email.toLowerCase() === normalizedEmail);
+      if (existing) {
+        const merged = normalizeRoles([...getUserRoles(existing), ...requestedRoles]);
+        existing.roles = merged;
+        existing.role = getPrimaryRole(merged);
+        if (department && !existing.department) {
+          existing.department = String(department).trim();
+        }
+        if (existing.status === 'suspended') {
+          existing.status = 'active';
+        }
+        saveDatabase();
+        res.status(200).json({
+          user: sanitizeUser(existing),
+          mergedExisting: true,
+        });
+        return;
+      }
+
+      if (!name) {
+        res.status(400).json({ error: 'Full name is required when creating a new staff account.' });
+        return;
+      }
+
+      const initialPassword =
+        typeof password === 'string' && password.trim().length >= 6
+          ? password.trim()
+          : 'printhaus123';
+
+      const newUser: UserAccount = {
+        id: `usr_${crypto.randomUUID().slice(0, 8)}`,
+        name: String(name).trim(),
+        email: normalizedEmail,
+        passwordHash: hashPasswordScrypt(initialPassword),
+        department: String(department || 'Print Operations & Pickup Desk').trim(),
+        matricNumber: matricNumber ? String(matricNumber).trim() : undefined,
+        residency: residency === 'on-campus' ? 'on-campus' : 'off-campus',
+        role: getPrimaryRole(requestedRoles),
+        roles: requestedRoles,
+        status: 'active',
+        createdAt: new Date().toISOString(),
+      };
+      db.users.push(newUser);
+      saveDatabase();
+      res.status(201).json({
+        user: sanitizeUser(newUser),
+        mergedExisting: false,
+      });
+    }
+  );
+
+  app.patch(
+    '/api/admin/users/:id/roles',
+    requireAuth,
+    requireRole('admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const user = db.users.find((u) => u.id === req.params.id);
+      if (!user) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+
+      const rawRoles = req.body?.roles;
+      if (!Array.isArray(rawRoles) || rawRoles.length === 0) {
+        res.status(400).json({ error: 'At least one valid role (student, staff, or admin) is required.' });
+        return;
+      }
+
+      const nextRoles = normalizeRoles(rawRoles as UserRole[]);
+      if (user.id === req.authUser!.id && !nextRoles.includes('admin')) {
+        res.status(400).json({ error: 'You cannot remove your own admin permission.' });
+        return;
+      }
+
+      user.roles = nextRoles;
+      user.role = getPrimaryRole(nextRoles);
+      saveDatabase();
+      res.json({ user: sanitizeUser(user) });
+    }
+  );
+
+  app.patch(
+    '/api/admin/users/:id',
+    requireAuth,
+    requireRole('admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const user = db.users.find((u) => u.id === req.params.id);
+      if (!user) {
+        res.status(404).json({ error: 'User not found.' });
+        return;
+      }
+
+      const { status, role, roles, department } = req.body ?? {};
+      if (status === 'active' || status === 'suspended') {
+        if (user.id === req.authUser!.id && status === 'suspended') {
+          res.status(400).json({ error: 'You cannot deactivate your own active admin account.' });
+          return;
+        }
+        user.status = status;
+      }
+
+      if (Array.isArray(roles) && roles.length > 0) {
+        const nextRoles = normalizeRoles(roles as UserRole[]);
+        if (user.id === req.authUser!.id && !nextRoles.includes('admin')) {
+          res.status(400).json({ error: 'You cannot remove your own admin permission.' });
+          return;
+        }
+        user.roles = nextRoles;
+        user.role = getPrimaryRole(nextRoles);
+      } else if (role === 'student' || role === 'staff' || role === 'admin') {
+        const nextRoles = normalizeRoles([role]);
+        user.roles = nextRoles;
+        user.role = getPrimaryRole(nextRoles);
+      }
+
+      if (typeof department === 'string' && department.trim()) {
+        user.department = department.trim();
+      }
+
+      saveDatabase();
+      res.json({ user: sanitizeUser(user) });
+    }
+  );
+
+  app.get(
+    '/api/admin/partners',
+    requireAuth,
+    requireRole('staff', 'admin'),
+    (_req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      res.json({ partners: db.partners });
+    }
+  );
+
+  app.patch(
+    '/api/admin/partners/:id',
+    requireAuth,
+    requireRole('admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const partner = db.partners.find((p) => p.id === req.params.id);
+      if (!partner) {
+        res.status(404).json({ error: 'Partner not found.' });
+        return;
+      }
+      const { status, turnaroundMinutes, costPerBwPage, costPerColorPage } = req.body ?? {};
+      if (['available', 'busy', 'offline'].includes(status)) partner.status = status;
+      if (typeof turnaroundMinutes === 'number') partner.turnaroundMinutes = turnaroundMinutes;
+      if (typeof costPerBwPage === 'number') partner.costPerBwPage = costPerBwPage;
+      if (typeof costPerColorPage === 'number') partner.costPerColorPage = costPerColorPage;
+      saveDatabase();
+      res.json({ partner });
+    }
+  );
+
+  app.get('/api/complaints', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
+    const authUser = req.authUser!;
     const { studentId } = req.query;
-    const list = studentId
-      ? db.complaints.filter((c) => c.studentId === String(studentId))
-      : db.complaints;
+    const isPrivileged = userHasRole(authUser, 'staff') || userHasRole(authUser, 'admin');
+
+    const list =
+      !isPrivileged || studentId === authUser.id
+        ? db.complaints.filter((c) => c.studentId === authUser.id)
+        : studentId
+          ? db.complaints.filter((c) => c.studentId === String(studentId))
+          : db.complaints;
     res.json({ complaints: list });
   });
 
-  app.post('/api/complaints', (req: Request, res: Response) => {
+  app.post('/api/complaints', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
-    const { orderId, studentId, subject, description } = req.body ?? {};
+    const authUser = req.authUser!;
+    const { orderId, subject, description } = req.body ?? {};
     const order = db.orders.find((o) => o.id === orderId || o.orderCode === orderId);
     if (!order || !subject || !description) {
       res.status(400).json({ error: 'Order, subject, and description are required.' });
+      return;
+    }
+    if (order.studentId !== authUser.id && !userHasRole(authUser, 'admin')) {
+      res.status(403).json({ error: 'Forbidden: you can only file support tickets for your own orders.' });
       return;
     }
     const nowIso = new Date().toISOString();
@@ -1108,7 +1785,7 @@ async function startServer() {
       id: `cmp_${crypto.randomUUID().slice(0, 8)}`,
       orderId: order.id,
       orderCode: order.orderCode,
-      studentId: String(studentId || order.studentId),
+      studentId: order.studentId,
       studentName: order.studentName,
       subject: String(subject).trim(),
       description: String(description).trim(),
@@ -1123,56 +1800,69 @@ async function startServer() {
     res.status(201).json({ complaint: ticket });
   });
 
-  app.patch('/api/complaints/:id', (req: Request, res: Response) => {
-    const db = getDb();
-    const ticket = db.complaints.find((c) => c.id === req.params.id);
-    if (!ticket) {
-      res.status(404).json({ error: 'Ticket not found.' });
-      return;
-    }
-    const { status, resolutionNote, refundAmount } = req.body ?? {};
-    if (['open', 'resolved', 'refunded'].includes(status)) ticket.status = status;
-    if (resolutionNote !== undefined) ticket.resolutionNote = String(resolutionNote);
-    if (typeof refundAmount === 'number') ticket.refundAmount = Math.max(0, refundAmount);
-
-    if (ticket.status === 'refunded') {
-      const order = db.orders.find((o) => o.id === ticket.orderId);
-      if (order) {
-        order.paymentStatus = 'refunded';
-        order.updatedAt = new Date().toISOString();
+  app.patch(
+    '/api/complaints/:id',
+    requireAuth,
+    requireRole('admin'),
+    (req: AuthenticatedRequest, res: Response) => {
+      const db = getDb();
+      const ticket = db.complaints.find((c) => c.id === req.params.id);
+      if (!ticket) {
+        res.status(404).json({ error: 'Ticket not found.' });
+        return;
       }
-      db.notifications.unshift({
-        id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
-        userId: ticket.studentId,
-        orderCode: ticket.orderCode,
-        title: `Refund issued for ${ticket.orderCode}`,
-        message: `₦${ticket.refundAmount} refunded: ${ticket.resolutionNote || 'Approved by PrintHaus Admin.'}`,
-        read: false,
-        createdAt: new Date().toISOString(),
-      });
+      const { status, resolutionNote, refundAmount } = req.body ?? {};
+      if (['open', 'resolved', 'refunded'].includes(status)) ticket.status = status;
+      if (resolutionNote !== undefined) ticket.resolutionNote = String(resolutionNote);
+      if (typeof refundAmount === 'number') ticket.refundAmount = Math.max(0, refundAmount);
+
+      if (ticket.status === 'refunded') {
+        const order = db.orders.find((o) => o.id === ticket.orderId);
+        if (order) {
+          order.paymentStatus = 'refunded';
+          order.updatedAt = new Date().toISOString();
+        }
+        db.notifications.unshift({
+          id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
+          userId: ticket.studentId,
+          orderCode: ticket.orderCode,
+          title: `Refund issued for ${ticket.orderCode}`,
+          message: `₦${ticket.refundAmount} refunded: ${ticket.resolutionNote || 'Approved by PrintHaus Admin.'}`,
+          read: false,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      ticket.updatedAt = new Date().toISOString();
+      saveDatabase();
+      res.json({ complaint: ticket });
     }
+  );
 
-    ticket.updatedAt = new Date().toISOString();
-    saveDatabase();
-    res.json({ complaint: ticket });
-  });
-
-  app.get('/api/notifications', (req: Request, res: Response) => {
+  app.get('/api/notifications', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
+    const authUser = req.authUser!;
     const { userId } = req.query;
-    const list = userId
-      ? db.notifications.filter((n) => n.userId === String(userId))
-      : db.notifications;
+    const isAdmin = userHasRole(authUser, 'admin');
+    const targetUserId = isAdmin && userId ? String(userId) : authUser.id;
+    const list = db.notifications.filter((n) => n.userId === targetUserId);
     res.json({ notifications: list });
   });
 
-  app.patch('/api/notifications/:id/read', (req: Request, res: Response) => {
+  app.patch('/api/notifications/:id/read', requireAuth, (req: AuthenticatedRequest, res: Response) => {
     const db = getDb();
+    const authUser = req.authUser!;
     const item = db.notifications.find((n) => n.id === req.params.id);
-    if (item) {
-      item.read = true;
-      saveDatabase();
+    if (!item) {
+      res.status(404).json({ error: 'Notification not found.' });
+      return;
     }
+    if (item.userId !== authUser.id && !userHasRole(authUser, 'admin')) {
+      res.status(403).json({ error: 'Forbidden.' });
+      return;
+    }
+    item.read = true;
+    saveDatabase();
     res.json({ ok: true });
   });
 

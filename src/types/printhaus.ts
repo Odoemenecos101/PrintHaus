@@ -67,8 +67,48 @@ export interface UserAccount {
   hostelGender?: HostelGender;
   hostelName?: string;
   role: UserRole;
+  roles: UserRole[];
   status: 'active' | 'suspended';
   createdAt: string;
+}
+
+const VALID_ROLES: readonly UserRole[] = ['student', 'staff', 'admin'];
+
+export function normalizeRoles(
+  roles?: UserRole[] | null,
+  fallbackRole?: UserRole | null
+): UserRole[] {
+  const source: readonly UserRole[] =
+    Array.isArray(roles) && roles.length > 0
+      ? roles
+      : fallbackRole
+        ? [fallbackRole]
+        : (['student'] as const);
+  const unique: UserRole[] = [];
+  for (const r of source) {
+    if (VALID_ROLES.includes(r) && !unique.includes(r)) {
+      unique.push(r);
+    }
+  }
+  return unique.length > 0 ? unique : ['student'];
+}
+
+export function getUserRoles(user?: Pick<UserAccount, 'role' | 'roles'> | null): UserRole[] {
+  if (!user) return [];
+  return normalizeRoles(user.roles, user.role);
+}
+
+export function getPrimaryRole(roles: UserRole[]): UserRole {
+  if (roles.includes('admin')) return 'admin';
+  if (roles.includes('staff')) return 'staff';
+  return 'student';
+}
+
+export function userHasRole(
+  user: Pick<UserAccount, 'role' | 'roles'> | null | undefined,
+  role: UserRole
+): boolean {
+  return getUserRoles(user).includes(role);
 }
 
 export type OrderStatus =
@@ -170,10 +210,44 @@ export interface StatusHistoryEntry {
   timestamp: string;
 }
 
+export interface CollectionRecord {
+  orderId: string;
+  orderCode: string;
+  collectionCode: string;
+  qrReference: string;
+  studentId: string;
+  studentName: string;
+  matricNumber?: string;
+  staffId: string;
+  staffName: string;
+  staffEmail: string;
+  collectedAt: string;
+  amount: number;
+  paymentStatus: PaymentStatus;
+  method: 'qr_scan' | 'manual_lookup';
+}
+
+export interface CollectionHistoryEntry extends CollectionRecord {
+  id: string;
+  fileName: string;
+  pickupVenue: string;
+  status: 'collected';
+}
+
+export interface StaffOverviewMetrics {
+  totalOrders: number;
+  pendingOrders: number;
+  processingOrders: number;
+  readyForCollection: number;
+  collectedOrders: number;
+  recentCollections: CollectionHistoryEntry[];
+}
+
 export interface PrintOrder {
   id: string;
   orderCode: string;
   collectionCode: string;
+  qrReference: string;
   studentId: string;
   studentName: string;
   studentEmail: string;
@@ -198,6 +272,7 @@ export interface PrintOrder {
   pickupSlot: string;
   pickupShelf: string | null;
   rejectionReason: string | null;
+  collectionRecord?: CollectionRecord | null;
   createdAt: string;
   updatedAt: string;
 }

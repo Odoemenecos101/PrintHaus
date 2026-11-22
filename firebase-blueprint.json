@@ -54,6 +54,16 @@
           "type": "string",
           "enum": ["student", "staff", "admin"]
         },
+        "roles": {
+          "type": "array",
+          "description": "Multi-role assignments for a unified PrintHaus account.",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "type": "string",
+            "enum": ["student", "staff", "admin"]
+          }
+        },
         "status": {
           "type": "string",
           "enum": ["active", "suspended"]
@@ -124,6 +134,12 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 32
+        },
+        "qrReference": {
+          "type": "string",
+          "description": "Opaque QR pickup token that exposes no PII or private document URLs.",
+          "minLength": 1,
+          "maxLength": 64
         },
         "studentUid": {
           "type": "string",

@@ -66,6 +66,7 @@ service cloud.firestore {
           'hostelGender',
           'hostelName',
           'role',
+          'roles',
           'status',
           'createdAt',
           'updatedAt'
@@ -80,6 +81,13 @@ service cloud.firestore {
         && (!('hostelGender' in data) || data.hostelGender in ['male', 'female'])
         && (!('hostelName' in data) || (data.hostelName is string && data.hostelName.size() >= 1 && data.hostelName.size() <= 120))
         && data.role in ['student', 'staff', 'admin']
+        && (!('roles' in data) || (
+          data.roles is list
+          && data.roles.size() >= 1
+          && data.roles.size() <= 3
+          && data.roles[0] is string
+          && data.roles.hasOnly(['student', 'staff', 'admin'])
+        ))
         && data.status in ['active', 'suspended']
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -119,6 +127,7 @@ service cloud.firestore {
           'id',
           'orderCode',
           'collectionCode',
+          'qrReference',
           'studentUid',
           'studentId',
           'studentName',
@@ -141,6 +150,7 @@ service cloud.firestore {
         && isValidId(data.id)
         && data.orderCode is string && data.orderCode.size() >= 1 && data.orderCode.size() <= 32
         && data.collectionCode is string && data.collectionCode.size() >= 1 && data.collectionCode.size() <= 32
+        && (!('qrReference' in data) || (data.qrReference is string && data.qrReference.size() >= 1 && data.qrReference.size() <= 64))
         && isValidId(data.studentUid)
         && isValidId(data.studentId)
         && data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120
@@ -180,6 +190,7 @@ service cloud.firestore {
         && isValidUserProfile(incoming())
         && incoming().uid == userId
         && incoming().role == 'student'
+        && (!('roles' in incoming()) || incoming().roles == ['student'])
         && incoming().status == 'active'
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
@@ -198,6 +209,7 @@ service cloud.firestore {
             && incoming().uid == existing().uid
             && incoming().email == existing().email
             && incoming().role == existing().role
+            && ((!('roles' in existing()) && !('roles' in incoming())) || ('roles' in existing() && 'roles' in incoming() && incoming().roles == existing().roles))
             && incoming().status == existing().status
             && incoming().createdAt == existing().createdAt
             && incoming().updatedAt == request.time
@@ -240,6 +252,7 @@ service cloud.firestore {
         && isValidOrderRecord(incoming())
         && incoming().id == orderId
         && incoming().studentUid == request.auth.uid
+        && (!('qrReference' in incoming()) || (incoming().qrReference is string && incoming().qrReference.size() >= 1 && incoming().qrReference.size() <= 64))
         && (
           (incoming().status == 'order_received' && incoming().paymentStatus == 'pending')
           || (
@@ -256,6 +269,7 @@ service cloud.firestore {
         && incoming().id == existing().id
         && incoming().studentUid == existing().studentUid
         && incoming().studentId == existing().studentId
+        && ((!('qrReference' in existing()) && !('qrReference' in incoming())) || ('qrReference' in existing() && 'qrReference' in incoming() && incoming().qrReference == existing().qrReference))
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (

@@ -10,6 +10,7 @@ import {
   registerEmailPasswordUser,
   loginWithEmailPassword,
 } from '../firebase';
+import { setSessionToken } from '../lib/api';
 import {
   HostelGender,
   PAU_FEMALE_HOSTELS,
@@ -117,20 +118,46 @@ export function AuthModal({
     try {
       const credential = await signInWithPopup(auth, googleProvider);
       const fbUser = credential.user;
-      const existingProfile = await fetchFirestoreUserProfile(fbUser.uid);
+      setSessionToken(null);
+      const idToken = await fbUser.getIdToken();
+
+      const existingProfile = await fetchFirestoreUserProfile(fbUser.uid).catch(() => null);
 
       if (existingProfile) {
         if (existingProfile.status === 'suspended') {
           await signOut(auth).catch(() => {});
-          setError('This account has been suspended. Contact PrintHaus Admin.');
+          setError('This account has been deactivated or suspended. Contact PrintHaus Admin.');
           return;
         }
-        const synced = await syncFirebaseUserWithServer(existingProfile);
+        const synced = await syncFirebaseUserWithServer(existingProfile, idToken);
         onAuthenticated(synced);
         return;
       }
 
-      // First-time sign-in across any phone/device: collect PAU profile details once
+      // Check if an admin pre-invited this email (e.g. staff or multi-role Gmail)
+      const checkRes = await fetch('/api/auth/firebase-sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ checkOnly: true }),
+      });
+      if (checkRes.status === 403) {
+        const errData = await checkRes.json().catch(() => ({}));
+        await signOut(auth).catch(() => {});
+        setError(errData.error || 'This account has been deactivated or suspended.');
+        return;
+      }
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        if (checkData.user) {
+          onAuthenticated(checkData.user as UserAccount);
+          return;
+        }
+      }
+
+      // First-time student sign-in: collect PAU profile details once
       setPendingGoogleUser(fbUser);
       setName(fbUser.displayName || '');
       setEmail(fbUser.email || '');
@@ -195,6 +222,7 @@ const handleLogin = async (loginEmail: string, loginPass: string) => {
     if (!isSeededDemo) {
       try {
         const profile = await loginWithEmailPassword(loginEmail, loginPass);
+        setSessionToken(null);
         const synced = await syncFirebaseUserWithServer(profile);
         onAuthenticated(synced);
         return;
@@ -225,6 +253,7 @@ const handleLogin = async (loginEmail: string, loginPass: string) => {
     if (!res.ok) {
       throw new Error(data.error || 'Invalid email or password.');
     }
+    setSessionToken(data.token || null);
     onAuthenticated(data.user);
   } catch (err) {
     setError(
@@ -268,6 +297,7 @@ const handleSubmit = async (e: React.FormEvent) => {
         hostelName: residency === 'on-campus' ? hostelName : undefined,
       });
 
+      setSessionToken(null);
       const synced = await syncFirebaseUserWithServer(created);
       onAuthenticated(synced);
       return;
@@ -299,6 +329,7 @@ const handleSubmit = async (e: React.FormEvent) => {
     if (!res.ok) {
       throw new Error(data.error || 'Registration failed.');
     }
+    setSessionToken(data.token || null);
     onAuthenticated(data.user);
   } catch (err) {
     setError(
@@ -413,6 +444,7 @@ const handleSubmit = async (e: React.FormEvent) => {
       if (!res.ok) {
         throw new Error(data.error || 'Could not complete account recovery.');
       }
+      setSessionToken(data.token || null);
       onAuthenticated(data.user);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not complete account recovery.');
@@ -512,7 +544,7 @@ const handleSubmit = async (e: React.FormEvent) => {
                 <div className="relative flex items-center py-1">
                   <div className="grow border-t border-slate-200" />
                   <span className="shrink mx-3 text-[11px] font-medium text-slate-400">
-                    Or use campus email
+                    Or use account email
                   </span>
                   <div className="grow border-t border-slate-200" />
                 </div>
@@ -921,7 +953,11 @@ const handleSubmit = async (e: React.FormEvent) => {
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="name@pau.edu.ng"
+                    placeholder={
+                      mode === 'register'
+                        ? 'name@pau.edu.ng'
+                        : 'name@pau.edu.ng or staff email'
+                    }
                     className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700"
                   />
                 </div>

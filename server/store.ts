@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import {
+  CollectionHistoryEntry,
   ComplaintTicket,
   OrderNotification,
   OrderStatus,
@@ -12,6 +13,8 @@ import {
   SupplyItem,
   UserAccount,
   calculateMultiDocumentOrderPricing,
+  getPrimaryRole,
+  normalizeRoles,
 } from '../src/types/printhaus';
 
 export interface UploadedDocumentRecord {
@@ -32,6 +35,7 @@ export interface PrintHausDatabase {
   supplies: SupplyItem[];
   documents: UploadedDocumentRecord[];
   orders: PrintOrder[];
+  collections: CollectionHistoryEntry[];
   notifications: OrderNotification[];
   complaints: ComplaintTicket[];
 }
@@ -153,6 +157,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       department: 'Computer Science',
       residency: 'off-campus',
       role: 'student',
+      roles: ['student'],
       status: 'active',
       createdAt: hoursAgo(240),
     },
@@ -168,6 +173,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       hostelGender: 'female',
       hostelName: 'Cooperative Queens Hostel',
       role: 'student',
+      roles: ['student'],
       status: 'active',
       createdAt: hoursAgo(180),
     },
@@ -183,6 +189,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       hostelGender: 'male',
       hostelName: 'Emerald Hostel',
       role: 'student',
+      roles: ['student'],
       status: 'active',
       createdAt: hoursAgo(120),
     },
@@ -193,6 +200,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       passwordHash: hashPassword('staff123'),
       department: 'Print Operations & Pickup Desk',
       role: 'staff',
+      roles: ['staff'],
       status: 'active',
       createdAt: hoursAgo(400),
     },
@@ -203,6 +211,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       passwordHash: hashPassword('admin123'),
       department: 'Executive Operations',
       role: 'admin',
+      roles: ['admin'],
       status: 'active',
       createdAt: hoursAgo(500),
     },
@@ -419,6 +428,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       id: 'ord_2048',
       orderCode: 'PH-2048',
       collectionCode: 'PAU-7392',
+      qrReference: 'PHQR-2048-A9F4C21E7B8D',
       studentId: 'usr_student_1',
       studentName: 'Chidinma Okafor',
       studentEmail: 'chidinma.okafor@pau.edu.ng',
@@ -493,6 +503,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       id: 'ord_2049',
       orderCode: 'PH-2049',
       collectionCode: 'PAU-4185',
+      qrReference: 'PHQR-2049-B7E3D10A5C9F',
       studentId: 'usr_student_2',
       studentName: 'Toluwanimi Adeyemi',
       studentEmail: 'tolu.adeyemi@pau.edu.ng',
@@ -553,6 +564,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       id: 'ord_2050',
       orderCode: 'PH-2050',
       collectionCode: 'PAU-6021',
+      qrReference: 'PHQR-2050-C5A8E92F4D1B',
       studentId: 'usr_student_3',
       studentName: 'Ibrahim Bello',
       studentEmail: 'ibrahim.bello@pau.edu.ng',
@@ -599,6 +611,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       id: 'ord_2045',
       orderCode: 'PH-2045',
       collectionCode: 'PAU-1940',
+      qrReference: 'PHQR-2045-D3C6F81B2E0A',
       studentId: 'usr_student_1',
       studentName: 'Chidinma Okafor',
       studentEmail: 'chidinma.okafor@pau.edu.ng',
@@ -673,8 +686,47 @@ function buildInitialDatabase(): PrintHausDatabase {
       pickupSlot: 'Anytime during operating hours',
       pickupShelf: 'Cubby B-02',
       rejectionReason: null,
+      collectionRecord: {
+        orderId: 'ord_2045',
+        orderCode: 'PH-2045',
+        collectionCode: 'PAU-1940',
+        qrReference: 'PHQR-2045-D3C6F81B2E0A',
+        studentId: 'usr_student_1',
+        studentName: 'Chidinma Okafor',
+        matricNumber: '22120612944',
+        staffId: 'usr_staff_1',
+        staffName: 'Emeka Nwosu',
+        staffEmail: 'staff@printhaus.ng',
+        collectedAt: hoursAgo(44),
+        amount: calc1.breakdown.totalAmount,
+        paymentStatus: 'confirmed',
+        method: 'qr_scan',
+      },
       createdAt: hoursAgo(50),
       updatedAt: hoursAgo(44),
+    },
+  ];
+
+  const collections: CollectionHistoryEntry[] = [
+    {
+      id: 'col_2045',
+      orderId: 'ord_2045',
+      orderCode: 'PH-2045',
+      collectionCode: 'PAU-1940',
+      qrReference: 'PHQR-2045-D3C6F81B2E0A',
+      studentId: 'usr_student_1',
+      studentName: 'Chidinma Okafor',
+      matricNumber: '22120612944',
+      staffId: 'usr_staff_1',
+      staffName: 'Emeka Nwosu',
+      staffEmail: 'staff@printhaus.ng',
+      collectedAt: hoursAgo(44),
+      amount: calc1.breakdown.totalAmount,
+      paymentStatus: 'confirmed',
+      method: 'qr_scan',
+      fileName: 'ENT301_Feasibility_Study_Notes.pdf',
+      pickupVenue: "Student's Centre",
+      status: 'collected',
     },
   ];
 
@@ -724,12 +776,96 @@ function buildInitialDatabase(): PrintHausDatabase {
     supplies,
     documents,
     orders,
+    collections,
     notifications,
     complaints,
   };
 }
 
 let dbCache: PrintHausDatabase | null = null;
+
+export function generateQrReference(existingOrders: PrintOrder[]): string {
+  let qrRef = `PHQR-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
+  while (existingOrders.some((o) => o.qrReference === qrRef)) {
+    qrRef = `PHQR-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
+  }
+  return qrRef;
+}
+
+function migrateDatabase(db: PrintHausDatabase): boolean {
+  let changed = false;
+
+  if (!Array.isArray(db.collections)) {
+    db.collections = [];
+    changed = true;
+  }
+
+  for (const user of db.users) {
+    const normalized = normalizeRoles(user.roles, user.role);
+    const primary = getPrimaryRole(normalized);
+    if (
+      !Array.isArray(user.roles) ||
+      user.roles.length !== normalized.length ||
+      user.roles.some((r, idx) => r !== normalized[idx])
+    ) {
+      user.roles = normalized;
+      changed = true;
+    }
+    if (user.role !== primary) {
+      user.role = primary;
+      changed = true;
+    }
+  }
+
+  for (const order of db.orders) {
+    if (!order.qrReference) {
+      order.qrReference = generateQrReference(db.orders);
+      changed = true;
+    }
+
+    if (order.status === 'collected') {
+      const existingEntry = db.collections.find((c) => c.orderId === order.id);
+      if (!order.collectionRecord) {
+        const lastCollectedEvent = [...(order.statusHistory || [])]
+          .reverse()
+          .find((h) => h.status === 'collected');
+        const matchedStaff = db.users.find(
+          (u) => lastCollectedEvent?.actor && u.name === lastCollectedEvent.actor
+        );
+        order.collectionRecord = {
+          orderId: order.id,
+          orderCode: order.orderCode,
+          collectionCode: order.collectionCode,
+          qrReference: order.qrReference,
+          studentId: order.studentId,
+          studentName: order.studentName,
+          matricNumber: order.matricNumber,
+          staffId: matchedStaff?.id || 'usr_staff_1',
+          staffName: lastCollectedEvent?.actor || matchedStaff?.name || 'Emeka Nwosu',
+          staffEmail: matchedStaff?.email || 'staff@printhaus.ng',
+          collectedAt: lastCollectedEvent?.timestamp || order.updatedAt || order.createdAt,
+          amount: order.pricingBreakdown?.totalAmount ?? 0,
+          paymentStatus: order.paymentStatus,
+          method: 'qr_scan',
+        };
+        changed = true;
+      }
+
+      if (!existingEntry && order.collectionRecord) {
+        db.collections.push({
+          id: `col_${order.id.replace(/^ord_/, '')}`,
+          ...order.collectionRecord,
+          fileName: order.fileName,
+          pickupVenue: order.pickupVenue,
+          status: 'collected',
+        });
+        changed = true;
+      }
+    }
+  }
+
+  return changed;
+}
 
 export async function initDatabase(): Promise<PrintHausDatabase> {
   ensureDirs();
@@ -774,6 +910,9 @@ export async function initDatabase(): Promise<PrintHausDatabase> {
     try {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
       dbCache = JSON.parse(raw) as PrintHausDatabase;
+      if (migrateDatabase(dbCache)) {
+        saveDatabase();
+      }
       return dbCache;
     } catch {
       // Fallback to fresh seed if corrupted
@@ -807,6 +946,7 @@ export function getUploadsDir(): string {
 export function generateOrderCodes(existingOrders: PrintOrder[]): {
   orderCode: string;
   collectionCode: string;
+  qrReference: string;
 } {
   let num = 2051 + existingOrders.length;
   let orderCode = `PH-${num}`;
@@ -820,7 +960,9 @@ export function generateOrderCodes(existingOrders: PrintOrder[]): {
     collectionCode = `PAU-${Math.floor(1000 + Math.random() * 9000)}`;
   }
 
-  return { orderCode, collectionCode };
+  const qrReference = generateQrReference(existingOrders);
+
+  return { orderCode, collectionCode, qrReference };
 }
 
 export function getStatusLabel(status: OrderStatus): string {
