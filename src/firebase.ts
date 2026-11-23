@@ -34,6 +34,7 @@ import {
   UserRole,
   getPrimaryRole,
   getSchoolForProgramme,
+  isValidPauEmail,
   normalizeRoles,
 } from './types/printhaus';
 
@@ -134,6 +135,7 @@ export async function fetchFirestoreUserProfile(uid: string): Promise<UserAccoun
       id: String(data.uid || uid),
       name: String(data.name || ''),
       email: String(data.email || ''),
+      phone: data.phone ? String(data.phone) : undefined,
       matricNumber: String(data.matricNumber || ''),
       school: String(data.school || ''),
       department: String(data.department || ''),
@@ -198,8 +200,9 @@ export async function createFirestoreUserProfile(
   const uid = firebaseUser.uid;
   const path = `users/${uid}`;
   const cleanName = input.name.trim().slice(0, 120) || firebaseUser.displayName?.slice(0, 120) || 'PAU Student';
-  const cleanEmail = (firebaseUser.email || '').trim().slice(0, 160);
-  const cleanMatric = (input.matricNumber.trim() || 'PAU-NEW').slice(0, 40);
+  const cleanEmail = (firebaseUser.email || '').trim().toLowerCase().slice(0, 160);
+  const rawMatric = input.matricNumber.trim().slice(0, 40);
+  const cleanMatric = rawMatric.length >= 2 ? rawMatric : 'PAU-NEW';
   const cleanDept = (input.department.trim() || 'Computer Science').slice(0, 120);
   const cleanSchool = (getSchoolForProgramme(cleanDept) || 'School of Science and Technology').slice(0, 120);
 
@@ -253,6 +256,9 @@ export async function registerEmailPasswordUser(
   input: CreateFirestoreProfileInput
 ): Promise<UserAccount> {
   const cleanEmail = email.trim().toLowerCase();
+  if (!isValidPauEmail(cleanEmail)) {
+    throw new Error('Please enter a valid PAU student email address ending in @pau.edu.ng.');
+  }
   const cleanName = input.name.trim();
 
   try {
@@ -291,15 +297,23 @@ export async function registerEmailPasswordUser(
         }
         return createFirestoreUserProfile(existingCred.user, input);
       } catch (recoveryErr: unknown) {
+        const recCode =
+          recoveryErr && typeof recoveryErr === 'object' && 'code' in recoveryErr
+            ? String((recoveryErr as { code?: string }).code)
+            : '';
         if (
-          recoveryErr instanceof Error &&
-          recoveryErr.message.includes('already registered')
+          [
+            'auth/invalid-credential',
+            'auth/wrong-password',
+            'auth/too-many-requests',
+            'auth/user-disabled',
+          ].includes(recCode)
         ) {
-          throw recoveryErr;
+          throw new Error(
+            'An account with this email already exists. Switch to Sign In or use Forgot Password.'
+          );
         }
-        throw new Error(
-          'An account with this email already exists. Switch to Sign In or use Forgot Password.'
-        );
+        throw recoveryErr;
       }
     }
 
@@ -353,6 +367,18 @@ export async function syncOrderToFirestore(
       if (order.pickupShelf) {
         createPayload.pickupShelf = order.pickupShelf.slice(0, 64);
       }
+      if (order.pickupSlot) {
+        createPayload.pickupSlot = order.pickupSlot.slice(0, 120);
+      }
+      if (order.pickupEta) {
+        createPayload.pickupEta = order.pickupEta.slice(0, 120);
+      }
+      if (order.deliveryStaffName) {
+        createPayload.deliveryStaffName = order.deliveryStaffName.slice(0, 120);
+      }
+      if (order.deliveryStaffPhone) {
+        createPayload.deliveryStaffPhone = order.deliveryStaffPhone.slice(0, 32);
+      }
 
       await setDoc(orderRef, createPayload);
     } else {
@@ -367,6 +393,9 @@ export async function syncOrderToFirestore(
       };
       if (order.pickupShelf) {
         updatePayload.pickupShelf = order.pickupShelf.slice(0, 64);
+      }
+      if (order.pickupEta) {
+        updatePayload.pickupEta = order.pickupEta.slice(0, 120);
       }
       await updateDoc(orderRef, updatePayload);
     }
@@ -455,8 +484,11 @@ export async function fetchOrdersFromFirestore(firebaseUid: string): Promise<Pri
         assignedPartnerId: 'ptr_primary',
         assignedPartnerName: 'Lekki Academic Press (Primary)',
         pickupVenue: String(d.pickupVenue || 'Security Post in TYD'),
-        pickupSlot: 'Anytime during operating hours',
+        pickupSlot: String(d.pickupSlot || 'Anytime during operating hours'),
         pickupShelf: d.pickupShelf ? String(d.pickupShelf) : null,
+        pickupEta: d.pickupEta ? String(d.pickupEta) : null,
+        deliveryStaffName: d.deliveryStaffName ? String(d.deliveryStaffName) : null,
+        deliveryStaffPhone: d.deliveryStaffPhone ? String(d.deliveryStaffPhone) : null,
         rejectionReason: null,
         createdAt,
         updatedAt,
@@ -500,18 +532,19 @@ export async function syncFirebaseUserWithServer(
     }),
   });
 
-  if (res.status === 403) {
+  if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(
-      errData.error || 'This account has been deactivated or suspended. Contact PrintHaus Admin.'
+      errData.error ||
+        (res.status === 403
+          ? 'This account is deactivated or not permitted to register.'
+          : 'Could not complete server account setup. Please try again.')
     );
   }
 
-  if (res.ok) {
-    const data = await res.json();
-    if (data.user) {
-      return data.user as UserAccount;
-    }
+  const data = await res.json();
+  if (data.user) {
+    return data.user as UserAccount;
   }
 
   return {

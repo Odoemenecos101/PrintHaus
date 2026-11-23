@@ -59,6 +59,7 @@ export interface UserAccount {
   id: string;
   name: string;
   email: string;
+  phone?: string;
   passwordHash?: string;
   matricNumber?: string;
   school?: string;
@@ -109,6 +110,14 @@ export function userHasRole(
   role: UserRole
 ): boolean {
   return getUserRoles(user).includes(role);
+}
+
+export const PAU_EMAIL_REGEX = /^[a-z0-9._%+-]+@pau\.edu\.ng$/i;
+
+export function isValidPauEmail(email?: string | null): boolean {
+  if (!email) return false;
+  const clean = email.trim().toLowerCase();
+  return clean.length >= 12 && clean.length <= 160 && PAU_EMAIL_REGEX.test(clean);
 }
 
 export type OrderStatus =
@@ -271,6 +280,10 @@ export interface PrintOrder {
   pickupVenue: string;
   pickupSlot: string;
   pickupShelf: string | null;
+  pickupEta?: string | null;
+  deliveryStaffId?: string | null;
+  deliveryStaffName?: string | null;
+  deliveryStaffPhone?: string | null;
   rejectionReason: string | null;
   collectionRecord?: CollectionRecord | null;
   createdAt: string;
@@ -506,4 +519,62 @@ export function calculateOrderPricing(
     pricing,
     isFirstOrder
   ).breakdown;
+}
+
+export function sanitizePhone(phone?: string | null): string {
+  if (!phone) return '';
+  return String(phone).replace(/\s+/g, ' ').trim().slice(0, 32);
+}
+
+export function formatTelHref(phone?: string | null): string {
+  const clean = sanitizePhone(phone).replace(/[^\d+]/g, '');
+  return clean ? `tel:${clean}` : '#';
+}
+
+export function computeEstimatedPickupEta(
+  urgent: boolean = false,
+  preferredSlot?: string | null,
+  fromDate: Date = new Date()
+): string {
+  const cleanSlot = (preferredSlot || '').trim();
+  const isSpecificWindow =
+    cleanSlot &&
+    !cleanSlot.toLowerCase().includes('anytime') &&
+    !cleanSlot.toLowerCase().includes('as soon as');
+  if (isSpecificWindow) {
+    return cleanSlot;
+  }
+
+  const turnaroundMinutes = urgent ? 45 : 90;
+  const target = new Date(fromDate.getTime() + turnaroundMinutes * 60 * 1000);
+  try {
+    const parts = new Intl.DateTimeFormat('en-NG', {
+      timeZone: 'Africa/Lagos',
+      weekday: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(target);
+    const lagosHour = Number(
+      new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Africa/Lagos',
+        hour: 'numeric',
+        hour12: false,
+      }).format(target)
+    );
+    const dayName = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Africa/Lagos',
+      weekday: 'short',
+    }).format(target);
+
+    if (dayName === 'Sun' || lagosHour >= 17 || (dayName === 'Sat' && lagosHour >= 14)) {
+      return 'Next working day, 8:30 AM – 9:30 AM';
+    }
+    if (lagosHour < 8) {
+      return urgent ? 'Today, 8:45 AM – 9:15 AM' : 'Today, 9:30 AM – 10:15 AM';
+    }
+    return urgent ? `Priority arrival (~45 mins, est. ${parts})` : `Est. arrival today (${parts})`;
+  } catch {
+    return urgent ? 'Within ~45 mins during operating hours' : 'Within ~90 mins during operating hours';
+  }
 }

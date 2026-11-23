@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   LogOut,
   PackageCheck,
+  Phone,
   Printer,
   QrCode,
   RefreshCw,
@@ -26,6 +27,7 @@ import {
   UserAccount,
   UserRole,
   formatNaira,
+  formatTelHref,
 } from '../types/printhaus';
 import { QrScanner } from './QrScanner';
 import { StatusBadge } from './StatusPipeline';
@@ -65,12 +67,20 @@ export function StaffPortal({
   const [staffFilterOptions, setStaffFilterOptions] = useState<
     Array<{ staffId: string; staffName: string; staffEmail: string }>
   >([]);
+  const [couriers, setCouriers] = useState<
+    Array<{ id: string; name: string; email: string; phone: string; department: string }>
+  >([]);
 
   // Order management state
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [shelfInput, setShelfInput] = useState('Cubby A-06');
+  const [etaInput, setEtaInput] = useState('');
+  const [courierIdInput, setCourierIdInput] = useState('');
+  const [courierNameInput, setCourierNameInput] = useState('');
+  const [courierPhoneInput, setCourierPhoneInput] = useState('');
+  const [deliverySavedNotice, setDeliverySavedNotice] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState('');
   const [showRejectBox, setShowRejectBox] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -114,6 +124,7 @@ export function StaffPortal({
       ]);
 
       if (ovData.metrics) setOverview(ovData.metrics);
+      if (Array.isArray(ovData.couriers)) setCouriers(ovData.couriers);
       const list: PrintOrder[] = ordData.orders || [];
       setOrders(list);
       setPartners(ptrData.partners || []);
@@ -147,6 +158,16 @@ export function StaffPortal({
   });
 
   const selectedOrder = orders.find((o) => o.id === selectedId) || filteredOrders[0] || null;
+
+  useEffect(() => {
+    if (!selectedOrder) return;
+    setShelfInput(selectedOrder.pickupShelf || 'Cubby A-06');
+    setEtaInput(selectedOrder.pickupEta || selectedOrder.pickupSlot || '');
+    setCourierIdInput(selectedOrder.deliveryStaffId || user.id || '');
+    setCourierNameInput(selectedOrder.deliveryStaffName || user.name);
+    setCourierPhoneInput(selectedOrder.deliveryStaffPhone || user.phone || '');
+    setDeliverySavedNotice(null);
+  }, [selectedOrder?.id]);
 
   const handleDownloadDocument = async (documentId: string) => {
     const url = await buildAuthorizedDocumentUrl(documentId, true);
@@ -184,12 +205,18 @@ export function StaffPortal({
       note?: string;
       qualityChecklist?: Partial<QualityChecklist>;
       pickupShelf?: string;
+      pickupEta?: string;
+      deliveryStaffId?: string;
+      deliveryStaffName?: string;
+      deliveryStaffPhone?: string;
       assignedPartnerId?: string;
       rejectionReason?: string;
-    }
+    },
+    successNotice?: string
   ) => {
     setBusyId(order.id);
     setActionError(null);
+    setDeliverySavedNotice(null);
     try {
       const res = await apiFetch(`/api/orders/${order.id}/status`, {
         method: 'PATCH',
@@ -199,6 +226,8 @@ export function StaffPortal({
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         setActionError(err.error || 'Could not update order status.');
+      } else if (successNotice) {
+        setDeliverySavedNotice(successNotice);
       }
       setShowRejectBox(false);
       setRejectReason('');
@@ -706,6 +735,12 @@ export function StaffPortal({
                               {formatNaira(o.pricingBreakdown.totalAmount)}
                             </span>
                           </div>
+                          {(o.pickupEta || o.deliveryStaffPhone) && (
+                            <p className="text-[11px] text-blue-900 mt-1 truncate">
+                              {o.pickupEta ? o.pickupEta : o.pickupSlot}
+                              {o.deliveryStaffPhone ? ` · ${o.deliveryStaffPhone}` : ''}
+                            </p>
+                          )}
                         </button>
                       ))
                     )}
@@ -934,6 +969,141 @@ export function StaffPortal({
                       </div>
                     </div>
 
+                    {/* Pickup Arrival Time & Delivering Staff Assignment */}
+                    <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                            <Clock className="w-4 h-4 text-blue-800" />
+                            <span>Pickup Arrival Time &amp; Delivering Staff Contact</span>
+                          </span>
+                          <p className="text-[11px] text-slate-500 mt-0.5">
+                            Set when the package arrives at {selectedOrder.pickupVenue} and the staff member&apos;s phone number for the student.
+                          </p>
+                        </div>
+                        {deliverySavedNotice && (
+                          <span className="text-[11px] font-semibold text-emerald-700">
+                            {deliverySavedNotice}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                        <div>
+                          <label className="block font-medium text-slate-700 mb-1">
+                            Assign Staff / Courier
+                          </label>
+                          <select
+                            value={courierIdInput}
+                            onChange={(e) => {
+                              const pickedId = e.target.value;
+                              setCourierIdInput(pickedId);
+                              if (pickedId === user.id) {
+                                setCourierNameInput(user.name);
+                                if (user.phone) setCourierPhoneInput(user.phone);
+                              } else {
+                                const match = couriers.find((c) => c.id === pickedId);
+                                if (match) {
+                                  setCourierNameInput(match.name);
+                                  if (match.phone) setCourierPhoneInput(match.phone);
+                                }
+                              }
+                            }}
+                            className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
+                          >
+                            <option value={user.id}>Me ({user.name})</option>
+                            {couriers
+                              .filter((c) => c.id !== user.id)
+                              .map((c) => (
+                                <option key={c.id} value={c.id}>
+                                  {c.name} {c.phone ? `(${c.phone})` : ''}
+                                </option>
+                              ))}
+                            <option value="">Custom Staff / Dispatch Rider</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block font-medium text-slate-700 mb-1">
+                            Delivering Staff Name
+                          </label>
+                          <input
+                            type="text"
+                            value={courierNameInput}
+                            onChange={(e) => setCourierNameInput(e.target.value)}
+                            placeholder="e.g. Emeka Nwosu"
+                            className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block font-medium text-slate-700 mb-1">
+                            Delivering Staff Phone Number
+                          </label>
+                          <input
+                            type="tel"
+                            value={courierPhoneInput}
+                            onChange={(e) => setCourierPhoneInput(e.target.value)}
+                            placeholder="e.g. +234 803 482 1904"
+                            className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg bg-white"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block font-medium text-slate-700 mb-1">
+                            Pickup Arrival Time (ETA)
+                          </label>
+                          <input
+                            type="text"
+                            value={etaInput}
+                            onChange={(e) => setEtaInput(e.target.value)}
+                            placeholder="e.g. Today, 2:30 PM – 3:00 PM"
+                            className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {[
+                            'In 30 mins',
+                            'In 1 hour',
+                            'Today, 2:00 PM – 2:30 PM',
+                            'Arrived at pickup point now',
+                          ].map((preset) => (
+                            <button
+                              key={preset}
+                              type="button"
+                              onClick={() => setEtaInput(preset)}
+                              className="px-2 py-1 text-[11px] bg-white border border-slate-300 hover:border-blue-700 text-slate-700 rounded cursor-pointer"
+                            >
+                              {preset}
+                            </button>
+                          ))}
+                        </div>
+
+                        <button
+                          type="button"
+                          disabled={busyId === selectedOrder.id}
+                          onClick={() =>
+                            void handleUpdateOrder(
+                              selectedOrder,
+                              {
+                                pickupEta: etaInput.trim() || undefined,
+                                deliveryStaffId: courierIdInput,
+                                deliveryStaffName: courierNameInput.trim() || undefined,
+                                deliveryStaffPhone: courierPhoneInput.trim() || undefined,
+                              },
+                              'Saved & notified student'
+                            )
+                          }
+                          className="py-1.5 px-3.5 bg-slate-900 hover:bg-slate-800 disabled:bg-slate-400 text-white text-xs font-medium rounded-lg cursor-pointer whitespace-nowrap"
+                        >
+                          Save Delivery Time &amp; Phone
+                        </button>
+                      </div>
+                    </div>
+
                     {/* Workflow Status Actions */}
                     <div className="pt-2 border-t border-slate-200 space-y-3">
                       <div className="flex flex-wrap items-center gap-2">
@@ -982,6 +1152,10 @@ export function StaffPortal({
                               void handleUpdateOrder(selectedOrder, {
                                 status: 'ready_for_collection',
                                 pickupShelf: shelfInput,
+                                pickupEta: etaInput.trim() || undefined,
+                                deliveryStaffId: courierIdInput,
+                                deliveryStaffName: courierNameInput.trim() || undefined,
+                                deliveryStaffPhone: courierPhoneInput.trim() || undefined,
                               })
                             }
                             className="py-2 px-3.5 text-xs font-medium bg-emerald-700 hover:bg-emerald-800 disabled:bg-slate-300 text-white rounded-lg cursor-pointer disabled:cursor-not-allowed"
@@ -1146,6 +1320,28 @@ export function StaffPortal({
                           {lookupResult.order.pickupShelf || 'Counter Hold'}
                         </span>
                       </p>
+                      <p>
+                        <span className="font-semibold text-slate-900">Pickup Arrival Time:</span>{' '}
+                        {lookupResult.order.pickupEta || lookupResult.order.pickupSlot}
+                      </p>
+                      {(lookupResult.order.deliveryStaffName || lookupResult.order.deliveryStaffPhone) && (
+                        <p>
+                          <span className="font-semibold text-slate-900">Delivering Staff:</span>{' '}
+                          {lookupResult.order.deliveryStaffName || 'PrintHaus Dispatch'}
+                          {lookupResult.order.deliveryStaffPhone && (
+                            <>
+                              {' · '}
+                              <a
+                                href={formatTelHref(lookupResult.order.deliveryStaffPhone)}
+                                className="inline-flex items-center gap-1 font-mono font-semibold text-blue-800 underline"
+                              >
+                                <Phone className="w-3 h-3" />
+                                <span>{lookupResult.order.deliveryStaffPhone}</span>
+                              </a>
+                            </>
+                          )}
+                        </p>
+                      )}
                     </div>
 
                     {lookupResult.alreadyCollected && lookupResult.order.collectionRecord && (

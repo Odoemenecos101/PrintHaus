@@ -4,13 +4,14 @@ import {
   Clock,
   Download,
   Eye,
+  Phone,
   Printer,
   RefreshCw,
   Search,
 } from 'lucide-react';
 import { auth, fetchOrdersFromFirestore } from '../firebase';
 import { apiFetch } from '../lib/api';
-import { PrintOrder, formatNaira } from '../types/printhaus';
+import { PrintOrder, formatNaira, formatTelHref } from '../types/printhaus';
 import { QrCodeBox } from './QrCodeBox';
 import { StatusBadge, StatusPipeline } from './StatusPipeline';
 
@@ -289,6 +290,22 @@ export function OrderHistory({
                   <p className="text-[11px] text-slate-500 mt-1 truncate">
                     {new Date(ord.createdAt).toLocaleString()} · {ord.pickupVenue}
                   </p>
+                  {(ord.pickupEta || ord.deliveryStaffPhone) && (
+                    <p className="text-[11px] text-blue-900 mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 truncate">
+                      {ord.pickupEta && (
+                        <span className="inline-flex items-center gap-1 truncate">
+                          <Clock className="w-3 h-3 shrink-0" />
+                          <span className="truncate">{ord.pickupEta}</span>
+                        </span>
+                      )}
+                      {ord.deliveryStaffPhone && (
+                        <span className="inline-flex items-center gap-1 font-mono shrink-0">
+                          <Phone className="w-3 h-3 shrink-0" />
+                          <span>{ord.deliveryStaffPhone}</span>
+                        </span>
+                      )}
+                    </p>
+                  )}
                   <div className="flex items-center justify-between text-xs text-slate-500 mt-1.5 font-mono tabular-nums">
                     <span>
                       {ord.pricingBreakdown.totalPages}p ·{' '}
@@ -320,7 +337,18 @@ export function OrderHistory({
                   <p className="text-xs text-slate-500 mt-1 font-mono tabular-nums">
                     Placed {new Date(displayedActiveOrder.createdAt).toLocaleString()} ·{' '}
                     {displayedActiveOrder.pricingBreakdown.totalPages} total pages ·{' '}
-                    {formatNaira(displayedActiveOrder.pricingBreakdown.totalAmount)}
+                    {formatNaira(displayedActiveOrder.pricingBreakdown.perPageRate)}/pg ·{' '}
+                    {formatNaira(
+                      Math.round(
+                        displayedActiveOrder.pricingBreakdown.totalAmount /
+                          Math.max(
+                            1,
+                            displayedActiveOrder.pricingBreakdown.totalDocuments ??
+                              displayedActiveOrder.specs.copies
+                          )
+                      )
+                    )}
+                    /copy · Total {formatNaira(displayedActiveOrder.pricingBreakdown.totalAmount)}
                   </p>
                 </div>
 
@@ -400,21 +428,41 @@ export function OrderHistory({
                               : item.specs.binding === 'stapling'
                                 ? 'Stapling'
                                 : 'No bind'}
+                            {typeof item.perPageRate === 'number'
+                              ? ` · ${formatNaira(item.perPageRate)}/pg`
+                              : ''}
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onPreviewDocument({
-                              id: item.documentId,
-                              name: item.fileName,
-                              mime: item.fileType,
-                            })
-                          }
-                          className="py-1 px-2.5 border border-slate-300 rounded hover:bg-slate-50 text-slate-700 cursor-pointer shrink-0"
-                        >
-                          Preview
-                        </button>
+                        <div className="flex items-center gap-3 shrink-0">
+                          {typeof item.itemSubtotal === 'number' && (
+                            <div className="text-right font-mono tabular-nums">
+                              <p className="font-semibold text-slate-900">
+                                {formatNaira(item.itemSubtotal)}
+                              </p>
+                              <p className="text-[11px] text-slate-500">
+                                {formatNaira(
+                                  Math.round(
+                                    item.itemSubtotal / Math.max(1, item.specs.copies)
+                                  )
+                                )}
+                                /copy
+                              </p>
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onPreviewDocument({
+                                id: item.documentId,
+                                name: item.fileName,
+                                mime: item.fileType,
+                              })
+                            }
+                            className="py-1 px-2.5 border border-slate-300 rounded hover:bg-slate-50 text-slate-700 cursor-pointer shrink-0"
+                          >
+                            Preview
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -454,6 +502,44 @@ export function OrderHistory({
                         </div>
                       </div>
                     ))}
+                </div>
+              </div>
+
+              {/* Pickup Arrival Time & Delivering Staff Contact */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="p-4 bg-blue-50/60 border border-blue-200 rounded-xl space-y-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-blue-900 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5" />
+                    <span>Pickup Arrival Time</span>
+                  </p>
+                  <p className="text-sm font-semibold text-slate-950">
+                    {displayedActiveOrder.pickupEta || displayedActiveOrder.pickupSlot}
+                  </p>
+                  <p className="text-xs text-slate-600">
+                    Venue: <span className="font-medium text-slate-900">{displayedActiveOrder.pickupVenue}</span>
+                    {displayedActiveOrder.pickupShelf && ` · Shelf ${displayedActiveOrder.pickupShelf}`}
+                  </p>
+                </div>
+
+                <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-1">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 flex items-center gap-1.5">
+                    <Phone className="w-3.5 h-3.5 text-blue-800" />
+                    <span>Delivering Staff Contact</span>
+                  </p>
+                  <p className="text-sm font-semibold text-slate-950">
+                    {displayedActiveOrder.deliveryStaffName || 'PrintHaus Dispatch Desk'}
+                  </p>
+                  {displayedActiveOrder.deliveryStaffPhone ? (
+                    <a
+                      href={formatTelHref(displayedActiveOrder.deliveryStaffPhone)}
+                      className="inline-flex items-center gap-1.5 text-xs font-mono font-semibold text-blue-800 hover:text-blue-950 underline"
+                    >
+                      <Phone className="w-3 h-3" />
+                      <span>{displayedActiveOrder.deliveryStaffPhone}</span>
+                    </a>
+                  ) : (
+                    <p className="text-xs text-slate-500">Staff contact assigned upon dispatch</p>
+                  )}
                 </div>
               </div>
 

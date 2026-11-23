@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowRight, Check, FileText, MapPin, Printer, QrCode, Search } from 'lucide-react';
+import { ArrowRight, Check, Clock, FileText, MapPin, Phone, Printer, QrCode, Search } from 'lucide-react';
 import {
   BindingOption,
   ColorMode,
@@ -15,6 +15,7 @@ import {
   UserAccount,
   calculateOrderPricing,
   formatNaira,
+  formatTelHref,
 } from '../types/printhaus';
 import { QrScanner } from './QrScanner';
 import { StatusBadge, StatusPipeline } from './StatusPipeline';
@@ -95,6 +96,26 @@ export function LandingView({
     },
     pricing,
     false
+  );
+  const estBwRate = estSided === 'double' ? pricing.bwDoublePerPage : pricing.bwSinglePerPage;
+  const estColorRate =
+    estSided === 'double' ? pricing.colorDoublePerPage : pricing.colorSinglePerPage;
+  const estSingleRate =
+    estColor === 'color' ? pricing.colorSinglePerPage : pricing.bwSinglePerPage;
+  const estDoubleRate =
+    estColor === 'color' ? pricing.colorDoublePerPage : pricing.bwDoublePerPage;
+  const estBindingPerCopy =
+    estBinding === 'stapling'
+      ? pricing.stapling
+      : estBinding === 'spiral'
+        ? pricing.spiralBinding
+        : 0;
+  const estBwPerCopy = estPages * estBwRate + estBindingPerCopy;
+  const estColorPerCopy = estPages * estColorRate + estBindingPerCopy;
+  const estSinglePerCopy = estPages * estSingleRate + estBindingPerCopy;
+  const estDoublePerCopy = estPages * estDoubleRate + estBindingPerCopy;
+  const estPerCopyAmount = Math.round(
+    (estimate.printCost + estimate.finishingCost) / Math.max(1, estCopies)
   );
 
   // Live Order Tracker state
@@ -402,6 +423,12 @@ export function LandingView({
                       </td>
                     </tr>
                     <tr className="h-10">
+                      <td className="px-5 text-slate-700">Colour Double-Sided (per page)</td>
+                      <td className="px-5 text-right font-mono tabular-nums font-medium text-slate-900">
+                        {formatNaira(pricing.colorDoublePerPage)}
+                      </td>
+                    </tr>
+                    <tr className="h-10">
                       <td className="px-5 text-slate-700">Spiral Binding (entire copy)</td>
                       <td className="px-5 text-right font-mono tabular-nums font-medium text-slate-900">
                         {formatNaira(pricing.spiralBinding)}
@@ -433,6 +460,9 @@ export function LandingView({
                   <p className="font-display text-3xl font-bold text-slate-950 font-mono tabular-nums">
                     {formatNaira(estimate.totalAmount)}
                   </p>
+                  <p className="text-xs font-mono text-blue-900 tabular-nums mt-0.5">
+                    {formatNaira(estPerCopyAmount)}/copy · {formatNaira(estimate.perPageRate)}/pg
+                  </p>
                 </div>
               </div>
 
@@ -462,62 +492,104 @@ export function LandingView({
                   />
                 </div>
 
-                <div>
-                  <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                    Print Colour
-                  </label>
-                  <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+                <div className="sm:col-span-2">
+                  <div className="flex items-center justify-between gap-2 mb-1.5">
+                    <label className="block text-xs font-medium text-slate-700">
+                      Print Colour
+                    </label>
+                    <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                      {estPages} page{estPages === 1 ? '' : 's'}/copy ·{' '}
+                      {estSided === 'double' ? 'Double-sided' : 'Single-sided'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg">
                     <button
                       type="button"
                       onClick={() => setEstColor('bw')}
-                      className={`py-1.5 px-3 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                      className={`py-2 px-3 text-left rounded-md transition-colors cursor-pointer ${
                         estColor === 'bw'
                           ? 'bg-white text-slate-900 shadow-xs'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      Black & White
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium">Black & White</span>
+                        <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                          BW {estSided === 'double' ? 'Double' : 'Single'}:{' '}
+                          {formatNaira(estBwPerCopy)}/copy
+                        </span>
+                      </div>
+                      <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                        {formatNaira(estBwRate)}/pg
+                      </p>
                     </button>
                     <button
                       type="button"
                       onClick={() => setEstColor('color')}
-                      className={`py-1.5 px-3 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                      className={`py-2 px-3 text-left rounded-md transition-colors cursor-pointer ${
                         estColor === 'color'
                           ? 'bg-white text-slate-900 shadow-xs'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      Full Colour
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium">Full Colour</span>
+                        <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                          Colour {estSided === 'double' ? 'Double' : 'Single'}:{' '}
+                          {formatNaira(estColorPerCopy)}/copy
+                        </span>
+                      </div>
+                      <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                        {formatNaira(estColorRate)}/pg
+                      </p>
                     </button>
                   </div>
                 </div>
 
-                <div>
+                <div className="sm:col-span-2">
                   <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                    Page Sides
+                    Page Sides ({estColor === 'color' ? 'Full Colour' : 'Black & White'})
                   </label>
-                  <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg">
                     <button
                       type="button"
                       onClick={() => setEstSided('single')}
-                      className={`py-1.5 px-3 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                      className={`py-2 px-3 text-left rounded-md transition-colors cursor-pointer ${
                         estSided === 'single'
                           ? 'bg-white text-slate-900 shadow-xs'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      Single-Sided
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium">Single-Sided</span>
+                        <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                          {estColor === 'color' ? 'Colour' : 'BW'} Single:{' '}
+                          {formatNaira(estSinglePerCopy)}/copy
+                        </span>
+                      </div>
+                      <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                        {formatNaira(estSingleRate)}/pg
+                      </p>
                     </button>
                     <button
                       type="button"
                       onClick={() => setEstSided('double')}
-                      className={`py-1.5 px-3 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                      className={`py-2 px-3 text-left rounded-md transition-colors cursor-pointer ${
                         estSided === 'double'
                           ? 'bg-white text-slate-900 shadow-xs'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      Double-Sided
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium">Double-Sided</span>
+                        <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                          {estColor === 'color' ? 'Colour' : 'BW'} Double:{' '}
+                          {formatNaira(estDoublePerCopy)}/copy
+                        </span>
+                      </div>
+                      <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                        {formatNaira(estDoubleRate)}/pg
+                      </p>
                     </button>
                   </div>
                 </div>
@@ -751,6 +823,38 @@ export function LandingView({
                     <p className="text-xs text-slate-500">Total Paid</p>
                     <p className="text-base font-bold text-slate-950 tabular-nums">
                       {formatNaira(trackedOrder.pricingBreakdown.totalAmount)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="p-3.5 bg-blue-50/60 border border-blue-200 rounded-lg text-xs">
+                    <p className="font-semibold text-blue-900 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5" />
+                      <span>Pickup Arrival Time</span>
+                    </p>
+                    <p className="text-slate-900 font-medium mt-1">
+                      {trackedOrder.pickupEta || trackedOrder.pickupSlot}
+                    </p>
+                  </div>
+                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-lg text-xs">
+                    <p className="font-semibold text-slate-700 flex items-center gap-1.5">
+                      <Phone className="w-3.5 h-3.5 text-blue-800" />
+                      <span>Delivering Staff Member</span>
+                    </p>
+                    <p className="text-slate-900 font-medium mt-1">
+                      {trackedOrder.deliveryStaffName || 'PrintHaus Dispatch Desk'}
+                      {trackedOrder.deliveryStaffPhone && (
+                        <>
+                          {' · '}
+                          <a
+                            href={formatTelHref(trackedOrder.deliveryStaffPhone)}
+                            className="font-mono font-semibold text-blue-800 underline"
+                          >
+                            {trackedOrder.deliveryStaffPhone}
+                          </a>
+                        </>
+                      )}
                     </p>
                   </div>
                 </div>

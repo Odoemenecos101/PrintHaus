@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Bell,
   CheckCircle2,
+  Clock,
   Eye,
   FileText,
   LogOut,
   MessageSquareWarning,
   PackageCheck,
+  Phone,
   Plus,
   Trash2,
   Upload,
@@ -29,7 +31,10 @@ import {
   UserAccount,
   UserRole,
   calculateMultiDocumentOrderPricing,
+  computeEstimatedPickupEta,
   formatNaira,
+  formatTelHref,
+  getPerPageRate,
 } from '../types/printhaus';
 import {
   auth,
@@ -59,6 +64,9 @@ interface PickupToast {
   collectionCode: string;
   pickupVenue: string;
   pickupShelf: string | null;
+  pickupEta?: string | null;
+  deliveryStaffName?: string | null;
+  deliveryStaffPhone?: string | null;
   fileName: string;
   timestamp: string;
 }
@@ -102,7 +110,7 @@ export function StudentPortal({
   const [lamination, setLamination] = useState(false);
   const [urgent, setUrgent] = useState(false);
   const [orderQueue, setOrderQueue] = useState<OrderDocumentItemInput[]>([]);
-  const pickupSlot = 'Anytime during operating hours';
+  const [pickupSlot, setPickupSlot] = useState('As soon as ready (est. ~90 mins)');
   const initialCategory: 'off-campus' | 'male' | 'female' =
     user.residency === 'on-campus'
       ? user.hostelGender === 'female'
@@ -203,6 +211,9 @@ export function StudentPortal({
         collectionCode: order.collectionCode,
         pickupVenue: order.pickupVenue,
         pickupShelf: order.pickupShelf,
+        pickupEta: order.pickupEta,
+        deliveryStaffName: order.deliveryStaffName,
+        deliveryStaffPhone: order.deliveryStaffPhone,
         fileName: order.fileName,
         timestamp: new Date().toISOString(),
       };
@@ -389,6 +400,39 @@ export function StudentPortal({
     pricing,
     isFirstOrder
   );
+
+  const bwRateForSided =
+    sided === 'double' ? pricing.bwDoublePerPage : pricing.bwSinglePerPage;
+  const colorRateForSided =
+    sided === 'double' ? pricing.colorDoublePerPage : pricing.colorSinglePerPage;
+  const singleRateForSelectedColor =
+    colorMode === 'color' ? pricing.colorSinglePerPage : pricing.bwSinglePerPage;
+  const doubleRateForSelectedColor =
+    colorMode === 'color' ? pricing.colorDoublePerPage : pricing.bwDoublePerPage;
+  const currentPerPageRate = getPerPageRate({ colorMode, sided }, pricing);
+  const currentBindingPerCopy =
+    binding === 'stapling'
+      ? pricing.stapling
+      : binding === 'spiral'
+        ? pricing.spiralBinding
+        : 0;
+  const currentLaminationPerCopy = lamination
+    ? manualPageCount * pricing.laminationPerPage
+    : 0;
+  const bwPricePerCopy =
+    manualPageCount * bwRateForSided + currentBindingPerCopy + currentLaminationPerCopy;
+  const colorPricePerCopy =
+    manualPageCount * colorRateForSided + currentBindingPerCopy + currentLaminationPerCopy;
+  const singlePricePerCopy =
+    manualPageCount * singleRateForSelectedColor +
+    currentBindingPerCopy +
+    currentLaminationPerCopy;
+  const doublePricePerCopy =
+    manualPageCount * doubleRateForSelectedColor +
+    currentBindingPerCopy +
+    currentLaminationPerCopy;
+  const currentPricePerCopy =
+    colorMode === 'color' ? colorPricePerCopy : bwPricePerCopy;
 
   const handleFileChange = async (file: File | null) => {
     if (!file) return;
@@ -729,6 +773,41 @@ export function StudentPortal({
                       {formatNaira(orderSuccess.pricingBreakdown.totalAmount)} · Venue:{' '}
                       <span className="font-semibold text-slate-900">{orderSuccess.pickupVenue}</span>
                     </p>
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-700 pt-0.5">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-blue-800" />
+                        <span>
+                          Pickup Arrival:{' '}
+                          <span className="font-semibold text-slate-900">
+                            {orderSuccess.pickupEta || orderSuccess.pickupSlot}
+                          </span>
+                        </span>
+                      </span>
+                      {(orderSuccess.deliveryStaffName || orderSuccess.deliveryStaffPhone) && (
+                        <span className="inline-flex items-center gap-1.5">
+                          <Phone className="w-3.5 h-3.5 text-blue-800" />
+                          <span>
+                            Delivering Staff:{' '}
+                            <span className="font-semibold text-slate-900">
+                              {orderSuccess.deliveryStaffName || 'PrintHaus Dispatch'}
+                            </span>
+                            {orderSuccess.deliveryStaffPhone && (
+                              <>
+                                {' '}
+                                (
+                                <a
+                                  href={formatTelHref(orderSuccess.deliveryStaffPhone)}
+                                  className="font-mono font-semibold text-blue-800 underline"
+                                >
+                                  {orderSuccess.deliveryStaffPhone}
+                                </a>
+                                )
+                              </>
+                            )}
+                          </span>
+                        </span>
+                      )}
+                    </div>
                     <div className="flex flex-wrap items-center gap-3 pt-1">
                       <button
                         type="button"
@@ -882,55 +961,182 @@ export function StudentPortal({
                       )}
                     </div>
 
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium text-slate-700">
+                          Unit Cost by Print Option ({manualPageCount} page
+                          {manualPageCount === 1 ? '' : 's'}/copy)
+                        </span>
+                        <span className="text-[11px] font-mono text-slate-500">
+                          Click any option to select
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {(
+                          [
+                            {
+                              id: 'bw_single',
+                              label: 'BW Single',
+                              c: 'bw' as ColorMode,
+                              s: 'single' as SidedMode,
+                              rate: pricing.bwSinglePerPage,
+                            },
+                            {
+                              id: 'bw_double',
+                              label: 'BW Double',
+                              c: 'bw' as ColorMode,
+                              s: 'double' as SidedMode,
+                              rate: pricing.bwDoublePerPage,
+                            },
+                            {
+                              id: 'color_single',
+                              label: 'Colour Single',
+                              c: 'color' as ColorMode,
+                              s: 'single' as SidedMode,
+                              rate: pricing.colorSinglePerPage,
+                            },
+                            {
+                              id: 'color_double',
+                              label: 'Colour Double',
+                              c: 'color' as ColorMode,
+                              s: 'double' as SidedMode,
+                              rate: pricing.colorDoublePerPage,
+                            },
+                          ] as const
+                        ).map((opt) => {
+                          const isSelected = colorMode === opt.c && sided === opt.s;
+                          const unitCopyCost =
+                            manualPageCount * opt.rate +
+                            currentBindingPerCopy +
+                            currentLaminationPerCopy;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => {
+                                setColorMode(opt.c);
+                                setSided(opt.s);
+                              }}
+                              className={`p-2.5 text-left rounded-lg border transition-colors cursor-pointer ${
+                                isSelected
+                                  ? 'bg-blue-50/70 border-blue-700 text-slate-950'
+                                  : 'bg-slate-50/60 border-slate-200 hover:border-slate-300 text-slate-700'
+                              }`}
+                            >
+                              <p className="text-[11px] font-semibold leading-tight">
+                                {opt.label}:{' '}
+                                <span className="font-mono tabular-nums text-blue-800">
+                                  {formatNaira(unitCopyCost)}/copy
+                                </span>
+                              </p>
+                              <p className="text-[10px] font-mono tabular-nums text-slate-500 mt-1">
+                                {formatNaira(opt.rate)}/pg
+                              </p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                          Print Colour
-                        </label>
-                        <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+                      <div className="sm:col-span-2">
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                          <label className="block text-xs font-medium text-slate-700">
+                            Print Colour
+                          </label>
+                          <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                            {manualPageCount} page{manualPageCount === 1 ? '' : 's'}/copy ·{' '}
+                            {sided === 'double' ? 'Double-sided' : 'Single-sided'}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg">
                           <button
                             type="button"
                             onClick={() => setColorMode('bw')}
-                            className={`py-2 px-3 text-xs font-medium rounded-md cursor-pointer ${
-                              colorMode === 'bw' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                            className={`py-2 px-3 text-left rounded-md cursor-pointer transition-colors ${
+                              colorMode === 'bw'
+                                ? 'bg-white text-slate-900 shadow-xs'
+                                : 'text-slate-600 hover:text-slate-900'
                             }`}
                           >
-                            Black &amp; White
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-medium">Black &amp; White</span>
+                              <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                                BW {sided === 'double' ? 'Double' : 'Single'}:{' '}
+                                {formatNaira(bwPricePerCopy)}/copy
+                              </span>
+                            </div>
+                            <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                              {formatNaira(bwRateForSided)}/pg
+                            </p>
                           </button>
                           <button
                             type="button"
                             onClick={() => setColorMode('color')}
-                            className={`py-2 px-3 text-xs font-medium rounded-md cursor-pointer ${
-                              colorMode === 'color' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                            className={`py-2 px-3 text-left rounded-md cursor-pointer transition-colors ${
+                              colorMode === 'color'
+                                ? 'bg-white text-slate-900 shadow-xs'
+                                : 'text-slate-600 hover:text-slate-900'
                             }`}
                           >
-                            Full Colour
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-medium">Full Colour</span>
+                              <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                                Colour {sided === 'double' ? 'Double' : 'Single'}:{' '}
+                                {formatNaira(colorPricePerCopy)}/copy
+                              </span>
+                            </div>
+                            <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                              {formatNaira(colorRateForSided)}/pg
+                            </p>
                           </button>
                         </div>
                       </div>
 
-                      <div>
+                      <div className="sm:col-span-2">
                         <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                          Sidedness
+                          Sidedness ({colorMode === 'color' ? 'Full Colour' : 'Black & White'})
                         </label>
-                        <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 p-1 bg-slate-100 rounded-lg">
                           <button
                             type="button"
                             onClick={() => setSided('single')}
-                            className={`py-2 px-3 text-xs font-medium rounded-md cursor-pointer ${
-                              sided === 'single' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                            className={`py-2 px-3 text-left rounded-md cursor-pointer transition-colors ${
+                              sided === 'single'
+                                ? 'bg-white text-slate-900 shadow-xs'
+                                : 'text-slate-600 hover:text-slate-900'
                             }`}
                           >
-                            Single-Sided
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-medium">Single-Sided</span>
+                              <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                                {colorMode === 'color' ? 'Colour' : 'BW'} Single:{' '}
+                                {formatNaira(singlePricePerCopy)}/copy
+                              </span>
+                            </div>
+                            <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                              {formatNaira(singleRateForSelectedColor)}/pg
+                            </p>
                           </button>
                           <button
                             type="button"
                             onClick={() => setSided('double')}
-                            className={`py-2 px-3 text-xs font-medium rounded-md cursor-pointer ${
-                              sided === 'double' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                            className={`py-2 px-3 text-left rounded-md cursor-pointer transition-colors ${
+                              sided === 'double'
+                                ? 'bg-white text-slate-900 shadow-xs'
+                                : 'text-slate-600 hover:text-slate-900'
                             }`}
                           >
-                            Double-Sided
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-medium">Double-Sided</span>
+                              <span className="font-mono tabular-nums text-xs font-semibold text-blue-800">
+                                {colorMode === 'color' ? 'Colour' : 'BW'} Double:{' '}
+                                {formatNaira(doublePricePerCopy)}/copy
+                              </span>
+                            </div>
+                            <p className="font-mono tabular-nums text-[11px] text-slate-500 mt-0.5">
+                              {formatNaira(doubleRateForSelectedColor)}/pg
+                            </p>
                           </button>
                         </div>
                       </div>
@@ -944,9 +1150,9 @@ export function StudentPortal({
                           onChange={(e) => setBinding(e.target.value as BindingOption)}
                           className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
                         >
-                          <option value="none">No binding ({formatNaira(0)})</option>
-                          <option value="stapling">Corner stapling ({formatNaira(pricing.stapling)}/copy)</option>
-                          <option value="spiral">Spiral coil binding ({formatNaira(pricing.spiralBinding)} entire copy)</option>
+                          <option value="none">No binding ({formatNaira(0)}/copy)</option>
+                          <option value="stapling">Corner stapling (+{formatNaira(pricing.stapling)}/copy)</option>
+                          <option value="spiral">Spiral coil binding (+{formatNaira(pricing.spiralBinding)}/copy · entire copy)</option>
                         </select>
                       </div>
 
@@ -1039,13 +1245,45 @@ export function StudentPortal({
                             </optgroup>
                           </select>
                         </div>
+
+                        <div>
+                          <label
+                            htmlFor="pickup-window-select"
+                            className="block text-xs font-medium text-slate-700 mb-1.5"
+                          >
+                            Preferred Delivery / Pickup Arrival Time
+                          </label>
+                          <select
+                            id="pickup-window-select"
+                            value={pickupSlot}
+                            onChange={(e) => setPickupSlot(e.target.value)}
+                            className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-700"
+                          >
+                            <option value="As soon as ready (est. ~90 mins)">
+                              As soon as ready ({urgent ? 'est. ~45 mins priority' : 'est. ~90 mins'})
+                            </option>
+                            <option value="Today, Morning (9:00 AM – 11:30 AM)">
+                              Today, Morning (9:00 AM – 11:30 AM)
+                            </option>
+                            <option value="Today, Midday (12:00 PM – 2:30 PM)">
+                              Today, Midday (12:00 PM – 2:30 PM)
+                            </option>
+                            <option value="Today, Afternoon (3:00 PM – 5:00 PM)">
+                              Today, Afternoon (3:00 PM – 5:00 PM)
+                            </option>
+                            <option value="Next working day (8:30 AM – 10:00 AM)">
+                              Next working day (8:30 AM – 10:00 AM)
+                            </option>
+                          </select>
+                        </div>
                       </div>
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <label className="flex items-center justify-between p-3 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
                         <span className="text-xs font-medium text-slate-700">
-                          Laminate all pages (+{formatNaira(pricing.laminationPerPage)}/pg)
+                          Laminate all pages (+{formatNaira(pricing.laminationPerPage)}/pg · +
+                          {formatNaira(manualPageCount * pricing.laminationPerPage)}/copy)
                         </span>
                         <input
                           type="checkbox"
@@ -1056,7 +1294,7 @@ export function StudentPortal({
                       </label>
                       <label className="flex items-center justify-between p-3 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
                         <span className="text-xs font-medium text-slate-700">
-                          Urgent priority run (+{formatNaira(pricing.urgentFee)})
+                          Urgent priority run (+{formatNaira(pricing.urgentFee)} per order)
                         </span>
                         <input
                           type="checkbox"
@@ -1143,9 +1381,19 @@ export function StudentPortal({
                               </div>
 
                               <div className="flex items-center gap-2 shrink-0">
-                                <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                                  {formatNaira(item.itemSubtotal)}
-                                </span>
+                                <div className="text-right">
+                                  <span className="font-mono font-semibold text-slate-900 tabular-nums block">
+                                    {formatNaira(item.itemSubtotal)}
+                                  </span>
+                                  <span className="font-mono text-[11px] text-slate-500 tabular-nums block">
+                                    {formatNaira(
+                                      Math.round(
+                                        item.itemSubtotal / Math.max(1, item.specs.copies)
+                                      )
+                                    )}
+                                    /copy · {formatNaira(item.perPageRate)}/pg
+                                  </span>
+                                </div>
                                 <button
                                   type="button"
                                   onClick={() =>
@@ -1205,7 +1453,53 @@ export function StudentPortal({
                     )}
 
                   <div className="space-y-2.5 text-sm border-y border-slate-200 py-4">
-                    <div className="flex justify-between text-slate-600">
+                    <div className="flex justify-between text-slate-600 text-xs">
+                      <span>
+                        {computedItems.length <= 1
+                          ? `Rate per page (${
+                              (computedItems[0]?.specs.colorMode ?? colorMode) === 'color'
+                                ? 'Full Colour'
+                                : 'Black & White'
+                            })`
+                          : 'Average rate per page'}
+                      </span>
+                      <span className="font-mono tabular-nums font-medium text-slate-900">
+                        {formatNaira(
+                          computedItems.length === 1
+                            ? computedItems[0].perPageRate
+                            : computedItems.length > 1
+                              ? breakdown.perPageRate
+                              : currentPerPageRate
+                        )}
+                        /pg
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-slate-600 text-xs">
+                      <span>
+                        {computedItems.length <= 1
+                          ? `Price per copy (${
+                              computedItems[0]?.pageCount ?? manualPageCount
+                            }p)`
+                          : `Avg. price per copy (${breakdown.totalDocuments ?? 0} copies)`}
+                      </span>
+                      <span className="font-mono tabular-nums font-semibold text-blue-900">
+                        {formatNaira(
+                          computedItems.length === 1
+                            ? Math.round(
+                                computedItems[0].itemSubtotal /
+                                  Math.max(1, computedItems[0].specs.copies)
+                              )
+                            : computedItems.length > 1
+                              ? Math.round(
+                                  (breakdown.printCost + breakdown.finishingCost) /
+                                    Math.max(1, breakdown.totalDocuments ?? 1)
+                                )
+                              : currentPricePerCopy
+                        )}
+                        /copy
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-slate-600 pt-1 border-t border-slate-100">
                       <span>
                         Printing ({breakdown.totalPages} total pages)
                       </span>
@@ -1291,9 +1585,20 @@ export function StudentPortal({
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between text-xs px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg">
-                    <span className="text-slate-600">Selected Pickup Point</span>
-                    <span className="font-semibold text-slate-900 text-right">{pickupVenue}</span>
+                  <div className="space-y-1.5 text-xs px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">Selected Pickup Point</span>
+                      <span className="font-semibold text-slate-900 text-right">{pickupVenue}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">Expected Pickup Arrival</span>
+                      <span className="font-medium text-blue-900 text-right">
+                        {computeEstimatedPickupEta(
+                          checkoutItems.some((item) => item.specs.urgent),
+                          pickupSlot
+                        )}
+                      </span>
+                    </div>
                   </div>
 
                   <button
@@ -1600,6 +1905,21 @@ export function StudentPortal({
                 <span className="text-slate-500">Pickup Venue</span>
                 <span className="font-medium text-slate-900">{receiptOrder.pickupVenue}</span>
               </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-slate-500 shrink-0">Pickup Arrival Time</span>
+                <span className="font-medium text-slate-900 text-right">
+                  {receiptOrder.pickupEta || receiptOrder.pickupSlot}
+                </span>
+              </div>
+              {(receiptOrder.deliveryStaffName || receiptOrder.deliveryStaffPhone) && (
+                <div className="flex justify-between gap-4">
+                  <span className="text-slate-500 shrink-0">Delivering Staff</span>
+                  <span className="font-medium text-slate-900 text-right">
+                    {receiptOrder.deliveryStaffName || 'PrintHaus Dispatch'}
+                    {receiptOrder.deliveryStaffPhone ? ` · ${receiptOrder.deliveryStaffPhone}` : ''}
+                  </span>
+                </div>
+              )}
               <div className="flex justify-between">
                 <span className="text-slate-500">Payment Ref</span>
                 <span className="font-mono text-slate-900">{receiptOrder.paymentReference}</span>
@@ -1666,6 +1986,18 @@ export function StudentPortal({
                     {toast.collectionCode}
                   </span>
                 </p>
+                {(toast.pickupEta || toast.deliveryStaffPhone) && (
+                  <p className="text-[11px] text-blue-900 mt-1">
+                    {toast.pickupEta && <span>{toast.pickupEta}</span>}
+                    {toast.pickupEta && toast.deliveryStaffPhone && ' · '}
+                    {toast.deliveryStaffPhone && (
+                      <span className="font-mono font-semibold">
+                        {toast.deliveryStaffName ? `${toast.deliveryStaffName}: ` : 'Staff: '}
+                        {toast.deliveryStaffPhone}
+                      </span>
+                    )}
+                  </p>
+                )}
                 <div className="mt-2 flex items-center gap-3">
                   <button
                     type="button"

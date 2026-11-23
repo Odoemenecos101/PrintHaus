@@ -13,8 +13,10 @@ import {
   SupplyItem,
   UserAccount,
   calculateMultiDocumentOrderPricing,
+  computeEstimatedPickupEta,
   getPrimaryRole,
   normalizeRoles,
+  userHasRole,
 } from '../src/types/printhaus';
 
 export interface UploadedDocumentRecord {
@@ -197,6 +199,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       id: 'usr_staff_1',
       name: 'Emeka Nwosu',
       email: 'staff@printhaus.ng',
+      phone: '+234 803 482 1904',
       passwordHash: hashPassword('staff123'),
       department: 'Print Operations & Pickup Desk',
       role: 'staff',
@@ -208,6 +211,7 @@ function buildInitialDatabase(): PrintHausDatabase {
       id: 'usr_admin_1',
       name: 'Amara Eze',
       email: 'admin@printhaus.ng',
+      phone: '+234 805 914 2208',
       passwordHash: hashPassword('admin123'),
       department: 'Executive Operations',
       role: 'admin',
@@ -495,6 +499,10 @@ function buildInitialDatabase(): PrintHausDatabase {
       pickupVenue: 'Security Post in TYD',
       pickupSlot: 'Anytime during operating hours',
       pickupShelf: 'Cubby A-04',
+      pickupEta: 'Arrived at pickup point today, 11:20 AM',
+      deliveryStaffId: 'usr_staff_1',
+      deliveryStaffName: 'Emeka Nwosu',
+      deliveryStaffPhone: '+234 803 482 1904',
       rejectionReason: null,
       createdAt: hoursAgo(14),
       updatedAt: hoursAgo(2.4),
@@ -556,6 +564,10 @@ function buildInitialDatabase(): PrintHausDatabase {
       pickupVenue: 'Cooperative Queens Hostel',
       pickupSlot: 'Anytime during operating hours',
       pickupShelf: null,
+      pickupEta: 'Expected today, 2:30 PM – 3:00 PM',
+      deliveryStaffId: 'usr_staff_1',
+      deliveryStaffName: 'Emeka Nwosu',
+      deliveryStaffPhone: '+234 803 482 1904',
       rejectionReason: null,
       createdAt: hoursAgo(5),
       updatedAt: hoursAgo(1.5),
@@ -603,6 +615,10 @@ function buildInitialDatabase(): PrintHausDatabase {
       pickupVenue: 'Emerald Hostel',
       pickupSlot: 'Anytime during operating hours',
       pickupShelf: null,
+      pickupEta: 'Estimated today, 3:30 PM – 4:15 PM',
+      deliveryStaffId: 'usr_staff_1',
+      deliveryStaffName: 'Emeka Nwosu',
+      deliveryStaffPhone: '+234 803 482 1904',
       rejectionReason: null,
       createdAt: hoursAgo(0.7),
       updatedAt: hoursAgo(0.7),
@@ -685,6 +701,10 @@ function buildInitialDatabase(): PrintHausDatabase {
       pickupVenue: "Student's Centre",
       pickupSlot: 'Anytime during operating hours',
       pickupShelf: 'Cubby B-02',
+      pickupEta: 'Delivered to pickup desk prior to collection',
+      deliveryStaffId: 'usr_staff_1',
+      deliveryStaffName: 'Emeka Nwosu',
+      deliveryStaffPhone: '+234 803 482 1904',
       rejectionReason: null,
       collectionRecord: {
         orderId: 'ord_2045',
@@ -815,11 +835,45 @@ function migrateDatabase(db: PrintHausDatabase): boolean {
       user.role = primary;
       changed = true;
     }
+    if (user.id === 'usr_staff_1' && !user.phone) {
+      user.phone = '+234 803 482 1904';
+      changed = true;
+    }
+    if (user.id === 'usr_admin_1' && !user.phone) {
+      user.phone = '+234 805 914 2208';
+      changed = true;
+    }
   }
+
+  const defaultCourier =
+    db.users.find((u) => u.id === 'usr_staff_1') ||
+    db.users.find((u) => userHasRole(u, 'staff') && u.status === 'active' && u.phone) ||
+    db.users.find((u) => userHasRole(u, 'staff') && u.status === 'active');
 
   for (const order of db.orders) {
     if (!order.qrReference) {
       order.qrReference = generateQrReference(db.orders);
+      changed = true;
+    }
+
+    if (!order.pickupEta) {
+      order.pickupEta =
+        order.status === 'ready_for_collection'
+          ? `Arrived at ${order.pickupVenue}${order.pickupShelf ? ` (${order.pickupShelf})` : ''}`
+          : order.status === 'collected'
+            ? 'Delivered to pickup desk prior to collection'
+            : computeEstimatedPickupEta(Boolean(order.specs?.urgent), order.pickupSlot);
+      changed = true;
+    }
+
+    if (!order.deliveryStaffName && defaultCourier) {
+      order.deliveryStaffId = defaultCourier.id;
+      order.deliveryStaffName = defaultCourier.name;
+      changed = true;
+    }
+
+    if (!order.deliveryStaffPhone && (defaultCourier?.phone || order.deliveryStaffId === 'usr_staff_1')) {
+      order.deliveryStaffPhone = defaultCourier?.phone || '+234 803 482 1904';
       changed = true;
     }
 

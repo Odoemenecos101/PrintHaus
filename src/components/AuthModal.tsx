@@ -20,6 +20,7 @@ import {
   ResidencyType,
   UserAccount,
   getSchoolForProgramme,
+  isValidPauEmail,
 } from '../types/printhaus';
 
 interface AuthModalProps {
@@ -158,7 +159,16 @@ export function AuthModal({
         }
       }
 
-      // First-time student sign-in: collect PAU profile details once
+      // First-time student sign-in: must be a valid @pau.edu.ng email unless bootstrapped admin
+      const fbEmail = (fbUser.email || '').trim().toLowerCase();
+      if (!isValidPauEmail(fbEmail) && fbEmail !== 'chukwuemekaodoemene@gmail.com') {
+        await signOut(auth).catch(() => {});
+        setError(
+          'Student registration requires a valid @pau.edu.ng email address. Staff accounts must be added by an Admin.'
+        );
+        return;
+      }
+
       setPendingGoogleUser(fbUser);
       setName(fbUser.displayName || '');
       setEmail(fbUser.email || '');
@@ -287,8 +297,8 @@ const handleSubmit = async (e: React.FormEvent) => {
     return;
   }
 
-  if (!email.trim().toLowerCase().endsWith('@pau.edu.ng')) {
-    setError('Please use your PAU student email address.');
+  if (!isValidPauEmail(email)) {
+    setError('Please enter a valid PAU student email address ending in @pau.edu.ng.');
     return;
   }
 

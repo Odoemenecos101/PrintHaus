@@ -34,10 +34,13 @@ import {
   UserAccount,
   UserRole,
   calculateMultiDocumentOrderPricing,
+  computeEstimatedPickupEta,
   getPrimaryRole,
   getSchoolForProgramme,
   getUserRoles,
+  isValidPauEmail,
   normalizeRoles,
+  sanitizePhone,
   userHasRole,
 } from './src/types/printhaus';
 
@@ -249,9 +252,9 @@ async function startServer() {
     }
 
     const normalizedEmail = String(email).trim().toLowerCase();
-    if (!normalizedEmail.endsWith('@pau.edu.ng')) {
+    if (!isValidPauEmail(normalizedEmail)) {
       res.status(400).json({
-        error: 'Public registration is restricted to PAU student email addresses (@pau.edu.ng).',
+        error: 'Public registration is restricted to valid PAU student email addresses (@pau.edu.ng).',
       });
       return;
     }
@@ -342,9 +345,21 @@ async function startServer() {
       (u) => u.id === cleanUid || u.email.toLowerCase() === normalizedEmail
     );
 
-    if (checkOnly && !existing) {
-      res.json({ exists: false, user: null });
-      return;
+    const isBootstrappedAdmin =
+      Boolean(decoded.email_verified) && normalizedEmail === 'chukwuemekaodoemene@gmail.com';
+
+    if (!existing) {
+      if (!isBootstrappedAdmin && !isValidPauEmail(normalizedEmail)) {
+        res.status(403).json({
+          error:
+            'Public registration requires a valid @pau.edu.ng email address. Staff accounts must be added by an Admin.',
+        });
+        return;
+      }
+      if (checkOnly) {
+        res.json({ exists: false, user: null });
+        return;
+      }
     }
 
     if (existing) {
@@ -411,8 +426,6 @@ async function startServer() {
       return;
     }
 
-    const isBootstrappedAdmin =
-      Boolean(decoded.email_verified) && normalizedEmail === 'chukwuemekaodoemene@gmail.com';
     const roles: UserRole[] = isBootstrappedAdmin ? ['admin', 'student'] : ['student'];
     const createdUser: UserAccount = {
       id: cleanUid,
@@ -916,7 +929,11 @@ async function startServer() {
         status: order.status,
         statusHistory: order.statusHistory,
         pickupVenue: order.pickupVenue,
+        pickupSlot: order.pickupSlot,
         pickupShelf: order.pickupShelf,
+        pickupEta: order.pickupEta ?? null,
+        deliveryStaffName: order.deliveryStaffName ?? null,
+        deliveryStaffPhone: order.deliveryStaffPhone ?? null,
         rejectionReason: order.rejectionReason,
         createdAt: order.createdAt,
         updatedAt: order.updatedAt,
@@ -1055,6 +1072,17 @@ async function startServer() {
       });
     }
 
+    const resolvedPickupSlot = String(pickupSlot || 'As soon as ready (est. ~90 mins)').slice(0, 120);
+    const resolvedPickupEta = computeEstimatedPickupEta(
+      summarySpecs.urgent,
+      resolvedPickupSlot,
+      new Date(nowIso)
+    );
+    const defaultCourier =
+      db.users.find((u) => userHasRole(u, 'staff') && u.status === 'active' && u.phone) ||
+      db.users.find((u) => userHasRole(u, 'staff') && u.status === 'active') ||
+      db.users.find((u) => u.id === 'usr_staff_1');
+
     const newOrder: PrintOrder = {
       id: `ord_${crypto.randomUUID().slice(0, 8)}`,
       orderCode,
@@ -1090,8 +1118,12 @@ async function startServer() {
       assignedPartnerId: primaryPartner?.id ?? 'ptr_primary',
       assignedPartnerName: primaryPartner?.name ?? 'Lekki Academic Press (Primary)',
       pickupVenue: String(pickupVenue || 'Security Post in TYD'),
-      pickupSlot: String(pickupSlot || 'Anytime during operating hours'),
+      pickupSlot: resolvedPickupSlot,
       pickupShelf: null,
+      pickupEta: resolvedPickupEta,
+      deliveryStaffId: defaultCourier?.id ?? null,
+      deliveryStaffName: defaultCourier?.name ?? 'PrintHaus Dispatch Desk',
+      deliveryStaffPhone: defaultCourier?.phone ?? '+234 803 482 1904',
       rejectionReason: null,
       collectionRecord: null,
       createdAt: nowIso,
@@ -1105,8 +1137,8 @@ async function startServer() {
       orderCode: newOrder.orderCode,
       title: `Order ${newOrder.orderCode} submitted`,
       message: autoConfirmed
-        ? `Payment confirmed. Your collection code is ${newOrder.collectionCode}.`
-        : `Order received. Staff will verify your bank transfer reference ${newOrder.paymentReference}.`,
+        ? `Payment confirmed. Code: ${newOrder.collectionCode}. Pickup ETA: ${newOrder.pickupEta}. Dispatch contact: ${newOrder.deliveryStaffName} (${newOrder.deliveryStaffPhone}).`
+        : `Order received. Staff will verify transfer ${newOrder.paymentReference}. Pickup ETA: ${newOrder.pickupEta}.`,
       read: false,
       createdAt: nowIso,
     });
@@ -1169,8 +1201,18 @@ async function startServer() {
         return;
       }
 
-      const { status, note, qualityChecklist, pickupShelf, assignedPartnerId, rejectionReason } =
-        req.body ?? {};
+      const {
+        status,
+        note,
+        qualityChecklist,
+        pickupShelf,
+        pickupEta,
+        deliveryStaffId,
+        deliveryStaffName,
+        deliveryStaffPhone,
+        assignedPartnerId,
+        rejectionReason,
+      } = req.body ?? {};
       const actorName = req.authUser!.name;
 
       if (status === 'collected') {
@@ -1201,6 +1243,35 @@ async function startServer() {
         }
       }
 
+      let deliveryUpdated = false;
+      if (typeof pickupEta === 'string' && pickupEta.trim()) {
+        const cleanEta = pickupEta.trim().slice(0, 120);
+        if (cleanEta !== (order.pickupEta || '')) {
+          order.pickupEta = cleanEta;
+          deliveryUpdated = true;
+        }
+      }
+
+      if (typeof deliveryStaffId === 'string') {
+        order.deliveryStaffId = deliveryStaffId.trim() ? deliveryStaffId.trim().slice(0, 128) : null;
+      }
+
+      if (typeof deliveryStaffName === 'string' && deliveryStaffName.trim()) {
+        const cleanStaffName = deliveryStaffName.trim().slice(0, 120);
+        if (cleanStaffName !== (order.deliveryStaffName || '')) {
+          order.deliveryStaffName = cleanStaffName;
+          deliveryUpdated = true;
+        }
+      }
+
+      if (typeof deliveryStaffPhone === 'string' && deliveryStaffPhone.trim()) {
+        const cleanStaffPhone = sanitizePhone(deliveryStaffPhone);
+        if (cleanStaffPhone && cleanStaffPhone !== (order.deliveryStaffPhone || '')) {
+          order.deliveryStaffPhone = cleanStaffPhone;
+          deliveryUpdated = true;
+        }
+      }
+
       if (status) {
         const nextStatus = status as OrderStatus;
         order.status = nextStatus;
@@ -1212,6 +1283,16 @@ async function startServer() {
             `Cubby ${String.fromCharCode(65 + (db.orders.length % 3))}-${String(
               (db.orders.length % 15) + 1
             ).padStart(2, '0')}`;
+          if (!order.deliveryStaffName) {
+            order.deliveryStaffId = req.authUser!.id;
+            order.deliveryStaffName = req.authUser!.name;
+          }
+          if (!order.deliveryStaffPhone) {
+            order.deliveryStaffPhone = req.authUser!.phone || '+234 803 482 1904';
+          }
+          if (!order.pickupEta) {
+            order.pickupEta = `Arrived at ${order.pickupVenue} (${order.pickupShelf})`;
+          }
         }
 
         if (nextStatus === 'rejected') {
@@ -1224,7 +1305,7 @@ async function startServer() {
           note:
             String(note || '').trim() ||
             (nextStatus === 'ready_for_collection'
-              ? `Packaged and placed at ${order.pickupVenue} (${order.pickupShelf}).`
+              ? `Packaged and placed at ${order.pickupVenue} (${order.pickupShelf}). Pickup time: ${order.pickupEta}. Staff contact: ${order.deliveryStaffName}${order.deliveryStaffPhone ? ` (${order.deliveryStaffPhone})` : ''}.`
               : `Updated to ${getStatusLabel(nextStatus)}.`),
           actor: actorName,
           timestamp: nowIso,
@@ -1245,12 +1326,38 @@ async function startServer() {
             title: titleMap[nextStatus]!,
             message:
               nextStatus === 'ready_for_collection'
-                ? `Collect anytime during operating hours at ${order.pickupVenue} (${order.pickupShelf}) with code ${order.collectionCode} or QR slip.`
+                ? `Collect anytime at ${order.pickupVenue} (${order.pickupShelf}) with code ${order.collectionCode}. Time: ${order.pickupEta}. Staff contact: ${order.deliveryStaffName}${order.deliveryStaffPhone ? ` (${order.deliveryStaffPhone})` : ''}.`
                 : String(note || `Order status is now ${getStatusLabel(nextStatus)}.`),
             read: false,
             createdAt: nowIso,
           });
         }
+      } else if (deliveryUpdated) {
+        const deliverySummary = [
+          order.pickupEta ? `Pickup time: ${order.pickupEta}` : '',
+          order.deliveryStaffName ? `Staff: ${order.deliveryStaffName}` : '',
+          order.deliveryStaffPhone ? `Phone: ${order.deliveryStaffPhone}` : '',
+        ]
+          .filter(Boolean)
+          .join(' · ');
+
+        order.statusHistory.push({
+          status: order.status,
+          label: getStatusLabel(order.status),
+          note: `Delivery details updated — ${deliverySummary}.`,
+          actor: actorName,
+          timestamp: nowIso,
+        });
+
+        db.notifications.unshift({
+          id: `ntf_${crypto.randomUUID().slice(0, 8)}`,
+          userId: order.studentId,
+          orderCode: order.orderCode,
+          title: `Delivery & pickup time updated for ${order.orderCode}`,
+          message: `${deliverySummary} at ${order.pickupVenue}.`,
+          read: false,
+          createdAt: nowIso,
+        });
       }
 
       order.updatedAt = nowIso;
@@ -1269,6 +1376,16 @@ async function startServer() {
       const sortedCollections = [...db.collections].sort(
         (a, b) => new Date(b.collectedAt).getTime() - new Date(a.collectedAt).getTime()
       );
+      const couriers = db.users
+        .filter((u) => (userHasRole(u, 'staff') || userHasRole(u, 'admin')) && u.status === 'active')
+        .map((u) => ({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          phone: u.phone || '',
+          department: u.department || 'Print Operations & Pickup Desk',
+        }));
+
       res.json({
         metrics: {
           totalOrders: db.orders.length,
@@ -1282,6 +1399,7 @@ async function startServer() {
           collectedOrders: db.orders.filter((o) => o.status === 'collected').length,
           recentCollections: sortedCollections.slice(0, 8),
         },
+        couriers,
       });
     }
   );
@@ -1594,7 +1712,7 @@ async function startServer() {
     requireRole('admin'),
     (req: AuthenticatedRequest, res: Response) => {
       const db = getDb();
-      const { name, email, role, roles, department, matricNumber, residency, password } =
+      const { name, email, phone, role, roles, department, matricNumber, residency, password } =
         req.body ?? {};
       if (!email) {
         res.status(400).json({ error: 'Email is required.' });
@@ -1602,6 +1720,7 @@ async function startServer() {
       }
 
       const normalizedEmail = String(email).trim().toLowerCase();
+      const cleanPhone = sanitizePhone(phone);
       const requestedRoles = normalizeRoles(
         Array.isArray(roles) ? (roles as UserRole[]) : undefined,
         role && ['student', 'staff', 'admin'].includes(role) ? (role as UserRole) : 'staff'
@@ -1615,6 +1734,9 @@ async function startServer() {
         existing.role = getPrimaryRole(merged);
         if (department && !existing.department) {
           existing.department = String(department).trim();
+        }
+        if (cleanPhone) {
+          existing.phone = cleanPhone;
         }
         if (existing.status === 'suspended') {
           existing.status = 'active';
@@ -1641,6 +1763,7 @@ async function startServer() {
         id: `usr_${crypto.randomUUID().slice(0, 8)}`,
         name: String(name).trim(),
         email: normalizedEmail,
+        phone: cleanPhone || undefined,
         passwordHash: hashPasswordScrypt(initialPassword),
         department: String(department || 'Print Operations & Pickup Desk').trim(),
         matricNumber: matricNumber ? String(matricNumber).trim() : undefined,
@@ -1702,7 +1825,7 @@ async function startServer() {
         return;
       }
 
-      const { status, role, roles, department } = req.body ?? {};
+      const { status, role, roles, department, phone } = req.body ?? {};
       if (status === 'active' || status === 'suspended') {
         if (user.id === req.authUser!.id && status === 'suspended') {
           res.status(400).json({ error: 'You cannot deactivate your own active admin account.' });
@@ -1727,6 +1850,11 @@ async function startServer() {
 
       if (typeof department === 'string' && department.trim()) {
         user.department = department.trim();
+      }
+
+      if (typeof phone === 'string') {
+        const clean = sanitizePhone(phone);
+        user.phone = clean || undefined;
       }
 
       saveDatabase();

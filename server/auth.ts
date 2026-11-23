@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { NextFunction, Request, Response } from 'express';
-import { UserAccount, UserRole, getPrimaryRole, getUserRoles } from '../src/types/printhaus';
+import { UserAccount, UserRole, getPrimaryRole, getUserRoles, isValidPauEmail } from '../src/types/printhaus';
 import { verifyFirebaseBearerToken } from './firebaseAdmin';
 import { getDb, saveDatabase } from './store';
 
@@ -122,9 +122,12 @@ function findOrProvisionFirebaseUser(
     return byEmail;
   }
 
-  // Brand-new Firebase user: strictly student role only unless matched above
+  // Brand-new Firebase user: strictly student role only unless bootstrapped admin
   const isBootstrappedAdmin =
     emailVerified && normalizedEmail === 'chukwuemekaodoemene@gmail.com';
+  if (!isBootstrappedAdmin && !isValidPauEmail(normalizedEmail)) {
+    return null;
+  }
   const roles: UserRole[] = isBootstrappedAdmin ? ['admin', 'student'] : ['student'];
   const newUser: UserAccount = {
     id: uid,
