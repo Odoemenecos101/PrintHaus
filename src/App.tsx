@@ -24,9 +24,9 @@ import {
 
 const DEFAULT_PRICING: PricingConfig = {
   bwSinglePerPage: 200,
-  bwDoublePerPage: 180,
+  bwDoublePerPage: 150,
   colorSinglePerPage: 350,
-  colorDoublePerPage: 300,
+  colorDoublePerPage: 280,
   stapling: 100,
   spiralBinding: 1000,
   laminationPerPage: 150,
